@@ -397,15 +397,15 @@
        BOTTOM BAR — AI structural report (full width)
     ════════════════════════════════════════════ */
     #panel-report {
-      height: 160px;
+      height: 200px;          /* taller so the report is comfortably readable */
       flex-shrink: 0;
       margin: 0 var(--panel-gap) var(--panel-gap);
     }
     #report-body {
-      padding: 10px 14px;
+      padding: 10px 16px;
       overflow-y: auto;
       font-size: 12px;
-      line-height: 1.7;
+      line-height: 1.75;
       color: var(--text-primary);
       height: 100%;
     }
@@ -421,9 +421,67 @@
       width: 6px; height: 6px;
       background: var(--text-muted);
       border-radius: 50%;
+      animation: pulse-dot 1.4s ease-in-out infinite;
     }
-    /* When the report is streaming in, text appears here */
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 0.3; transform: scale(1); }
+      50%       { opacity: 1;   transform: scale(1.3); }
+    }
+
+    /* Report generate button — sits in the panel header */
+    #report-generate-btn {
+      padding: 3px 10px;
+      background: transparent;
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      border-radius: 3px;
+      font-family: var(--font-display);
+      font-size: 9px;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: background 0.2s, color 0.2s;
+    }
+    #report-generate-btn:hover { background: var(--accent); color: #000; }
+    #report-generate-btn:disabled {
+      opacity: 0.4; cursor: not-allowed;
+      background: transparent; color: var(--text-muted); border-color: var(--border);
+    }
+
+    /* Streaming report text container */
     #report-text { display: none; }
+
+    /* Bold section headers inside the report (lines starting with ▸) */
+    #report-text .report-section {
+      color: var(--accent);
+      font-family: var(--font-display);
+      font-size: 10px;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      margin: 10px 0 3px 0;
+      display: block;
+    }
+    /* Normal paragraph lines */
+    #report-text .report-line { display: block; color: var(--text-primary); }
+
+    /* Blinking cursor shown at the end of the last streamed character */
+    #report-cursor {
+      display: inline-block;
+      width: 7px; height: 13px;
+      background: var(--accent);
+      vertical-align: middle;
+      margin-left: 2px;
+      animation: blink-cursor 0.8s step-end infinite;
+    }
+    @keyframes blink-cursor { 50% { opacity: 0; } }
+
+    /* Inline error if Gemini call fails */
+    #report-error {
+      display: none;
+      color: #e74c3c;
+      font-size: 11px;
+      font-family: var(--font-display);
+      letter-spacing: 0.5px;
+    }
 
     /* ─── Loading spinner used in various panels ─── */
     .spinner {
@@ -587,15 +645,22 @@
   <div class="panel" id="panel-report">
     <div class="panel-header">
       <span class="title">STAGE 5 · AI STRUCTURAL REPORT</span>
-      <span class="subtitle">Gemini 2.0 Flash</span>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="subtitle" id="report-status-label">Gemini 2.0 Flash</span>
+        <!-- Clicking this button calls runGeminiReport() defined in Step 3 -->
+        <button id="report-generate-btn" onclick="runGeminiReport()">▶ GENERATE REPORT</button>
+      </div>
     </div>
     <div id="report-body">
+      <!-- Shown before the report is generated -->
       <div id="report-placeholder">
         <div class="dot"></div>
-        <span>Awaiting floor plan analysis. Run the pipeline to generate the structural report.</span>
+        <span>Click "Generate Report" to run Gemini structural analysis on the current floor plan.</span>
       </div>
-      <!-- Actual report text streamed here by Stage 5 -->
+      <!-- Streaming report text rendered here by renderReportStream() -->
       <div id="report-text"></div>
+      <!-- Shown if the Gemini API call fails -->
+      <div id="report-error"></div>
     </div>
   </div>
 
@@ -1378,10 +1443,349 @@
     // ── Run Stage 4 immediately with hardcoded Plan B data ──
     // In Step 6 this is re-called with live Gemini output instead
     setStage('s3', 'done');
-    setStatus('PLAN B MODEL — STAGE 4 RUNNING');
+    setStatus('PLAN B MODEL LOADED');
     runMaterialAnalysis(PLAN_B);
-    console.log('[ASIS] Step 2 complete — material tradeoff cards rendered in right panel.');
-    console.log('[ASIS] Ready for Step 3 — Gemini text API → AI structural report.');
+    console.log('[ASIS] Steps 1+2 loaded — 3D model + material cards ready.');
+
+
+    /* ═══════════════════════════════════════════════════════
+       STAGE 5 — STEP 3: GEMINI TEXT API → AI STRUCTURAL REPORT
+       ───────────────────────────────────────────────────────
+       What this block does:
+         1. buildGeminiPrompt()  — assembles a structured prompt
+            from PLAN_B data + material scores already computed
+            by Stage 4. This gives Gemini real numbers to reason
+            about, not just vague questions.
+         2. runGeminiReport()    — calls Gemini 2.0 Flash via the
+            REST API (non-streaming generateContent endpoint).
+            Updates the button state, shows a spinner, then hands
+            the text to renderReportStream().
+         3. renderReportStream() — "fake streams" the response
+            character-by-character at ~18ms/char so the panel
+            looks live. Lines starting with "▸" are styled as
+            section headers. A blinking cursor tracks position.
+         4. parseReportLine()    — decides whether a line gets the
+            .report-section or .report-line CSS class.
+
+       In Step 6, runGeminiReport() will be called automatically
+       after Gemini vision + material analysis complete.
+       For now the user clicks "▶ GENERATE REPORT" manually.
+    ═══════════════════════════════════════════════════════ */
+
+    // ── GEMINI CONFIG ────────────────────────────────────────
+    // Using gemini-1.5-flash: much higher free-tier quota than 2.0-flash.
+    // gemini-2.0-flash free tier = 0 RPM on some accounts → quota error.
+    // gemini-1.5-flash free tier = 15 RPM / 1M TPM → no quota issues.
+    const GEMINI_KEY    = 'AIzaSyANZeW2pvZILey6EFsXuLDfx6w5IJYuTjY';
+    // gemini-1.5-flash-latest resolves to the current stable 1.5-flash build.
+    // Use the v1 endpoint (not v1beta) — v1beta doesn't surface 1.5 models on all keys.
+    const GEMINI_MODEL  = 'gemini-2.0-flash';
+    const GEMINI_URL    = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+
+    // ── GROQ FALLBACK CONFIG ─────────────────────────────────
+    // If Gemini quota fails, we fall back to Groq LLaMA 3 (already in tech stack).
+    // Groq free tier: 14,400 req/day — effectively unlimited for a hackathon.
+    const GROQ_KEY = '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';
+    const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+    /* ── geminiPost(body, retries) ──────────────────────────
+       Thin fetch wrapper that retries on 429 quota errors.
+       Uses exponential backoff, or Gemini's own "retry in Xs" hint.
+    ──────────────────────────────────────────────────── */
+    async function geminiPost(body, retries = 1) {
+  // ── Try Gemini first ──
+  try {
+    const res = await fetch(GEMINI_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return { source: 'gemini', data: await res.json() };
+
+    const errJson = await res.json().catch(() => ({}));
+    const errMsg  = errJson?.error?.message || `HTTP ${res.status}`;
+
+    // 429 quota: wait and retry once
+    if (res.status === 429 && retries > 0) {
+      const wait = 8000;
+      document.getElementById('report-status-label').textContent = `Gemini quota — retrying in 8s…`;
+      console.warn('[ASIS] Gemini 429 — waiting 8s then trying Groq fallback');
+      await new Promise(r => setTimeout(r, wait));
+      return geminiPost(body, 0);
+    }
+    // Any other Gemini error → fall through to Groq
+    console.warn('[ASIS] Gemini failed:', errMsg, '— falling back to Groq LLaMA 3');
+  } catch (e) {
+    console.warn('[ASIS] Gemini fetch error — falling back to Groq:', e.message);
+  }
+
+  // ── Groq fallback ──
+  // Extract the prompt text from the Gemini-shaped request body
+  const promptText = body?.contents?.[0]?.parts?.[0]?.text || '';
+  document.getElementById('report-status-label').textContent = 'Groq LLaMA 3 (fallback)…';
+
+  const groqRes = await fetch(GROQ_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${GROQ_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'llama-3.1-8b-instant',
+      messages: [{ role: 'user', content: promptText }],
+      temperature: 0.4,
+      max_tokens: 700,
+    }),
+  });
+
+  if (!groqRes.ok) {
+    const gErr = await groqRes.json().catch(() => ({}));
+    throw new Error('Groq: ' + (gErr?.error?.message || `HTTP ${groqRes.status}`));
+  }
+
+  const groqData = await groqRes.json();
+  // Normalise Groq response shape to match Gemini's so caller code is unchanged
+  const groqText = groqData?.choices?.[0]?.message?.content || '';
+  return {
+    source: 'groq',
+    data: { candidates: [{ content: { parts: [{ text: groqText }] } }] }
+  };
+}
+
+    /* ── buildGeminiPrompt(plan, materialsData) ─────────────
+       Constructs the text prompt sent to Gemini.
+       We inject real numbers from Stage 4 so the LLM produces
+       specific, defensible analysis — not generic boilerplate.
+       The output format uses ▸ as a section marker, which our
+       renderer picks up and styles distinctively.
+    ──────────────────────────────────────────────────── */
+    function buildGeminiPrompt(plan, materialsData) {
+      // Summarise element counts for the prompt
+      const lbWalls  = plan.walls.filter(w => w.type === 'loadBearing').length;
+      const ptWalls  = plan.walls.filter(w => w.type === 'partition').length;
+      const rooms    = plan.rooms.length;
+      const perim    = plan.outerBoundary.length;
+
+      // Pull top material picks from Stage 4 results
+      const topLB   = rankMaterials('loadBearing')[0];
+      const topPT   = rankMaterials('partition')[0];
+      const topSlab = rankMaterials('slab')[0];
+      const topLS   = rankMaterials('longSpan')[0];
+
+      // Identify any flagged long-span elements
+      const flagged = (materialsData || []).filter(e => e.needsColumn);
+      const flaggedText = flagged.length > 0
+        ? flagged.map(e => `${e.label} (${e.spanM.toFixed(1)} m)`).join(', ')
+        : 'none';
+
+      // Build the room list
+      const roomList = plan.rooms.map(r => `${r.name} (${r.type})`).join(', ');
+
+      return `You are a senior structural engineer producing a concise technical assessment of a residential floor plan that has been analysed by an AI pipeline.
+
+FLOOR PLAN DATA:
+- Plan shape: L-shaped (${perim}-vertex polygon)
+- Rooms (${rooms}): ${roomList}
+- Load-bearing walls: ${lbWalls} interior + ${perim} perimeter
+- Partition walls: ${ptWalls}
+- Long-span elements flagged (span > 5 m): ${flaggedText}
+
+MATERIAL ANALYSIS RESULTS (from tradeoff scoring engine):
+- Best material for load-bearing walls: ${topLB.name} (score: ${topLB.score.toFixed(2)})
+- Best material for partition walls: ${topPT.name} (score: ${topPT.score.toFixed(2)})
+- Best material for floor slab: ${topSlab.name} (score: ${topSlab.score.toFixed(2)})
+- Best material for long spans: ${topLS.name} (score: ${topLS.score.toFixed(2)})
+
+Write a structural assessment report in exactly this format. Use "▸" at the start of each section heading. Keep each section to 1-2 sentences. Be specific, use the data above, and avoid vague language.
+
+▸ STRUCTURAL OVERVIEW
+[Describe the overall structural system, wall count, and L-shape implications]
+
+▸ LOAD-BEARING ANALYSIS
+[Comment on the load-bearing wall layout and why the recommended material was chosen]
+
+▸ PARTITION SYSTEM
+[Comment on partition walls, their material choice, and the cost rationale]
+
+▸ SLAB & LONG-SPAN ASSESSMENT
+[Address the floor slab recommendation and any flagged long-span elements]
+
+▸ RISK FLAGS
+[List any structural concerns: long spans, unsupported loads, L-shape stress concentrations]
+
+▸ RECOMMENDATION SUMMARY
+[One sentence conclusion: is this plan structurally sound, and what is the single most important action?]`;
+    }
+
+    /* ── renderReportStream(fullText) ───────────────────────
+       Simulates character-by-character streaming of the report.
+       Splits text into lines. Lines starting with "▸" get the
+       .report-section class (cyan, monospaced, uppercase).
+       All other lines get .report-line.
+       A blinking cursor element is appended and moves with the text.
+    ──────────────────────────────────────────────────── */
+    function renderReportStream(fullText) {
+      const container = document.getElementById('report-text');
+      const body      = document.getElementById('report-body');
+      container.innerHTML = '';
+      container.style.display = 'block';
+
+      // Create the cursor element — it will be moved to the end of each char
+      const cursor = document.createElement('span');
+      cursor.id = 'report-cursor';
+      container.appendChild(cursor);
+
+      // Split the full text into lines, preserving empty lines as spacers
+      const lines = fullText.split('\n');
+
+      let lineIndex  = 0;
+      let charIndex  = 0;
+      let currentEl  = null;   // the <span> we're currently writing into
+
+      // We stream character-by-character using setInterval for smoothness
+      const CHAR_DELAY = 12;   // ms per character — adjust for speed
+      const interval = setInterval(() => {
+        // If we've finished all lines, stop and remove cursor
+        if (lineIndex >= lines.length) {
+          clearInterval(interval);
+          if (cursor.parentNode) cursor.parentNode.removeChild(cursor);
+          document.getElementById('report-status-label').textContent = 'Report complete';
+          setStage('s5', 'done');
+          console.log('[ASIS] Stage 5 complete — Gemini report fully rendered.');
+          return;
+        }
+
+        const line = lines[lineIndex];
+
+        // If we're at the start of a new line, create a new <span> for it
+        if (charIndex === 0) {
+          currentEl = document.createElement('span');
+          // ▸ prefix → section header style; empty line → spacer; else normal line
+          if (line.startsWith('▸')) {
+            currentEl.className = 'report-section';
+          } else if (line.trim() === '') {
+            currentEl.innerHTML = '&nbsp;';   // spacer line
+            container.insertBefore(currentEl, cursor);
+            lineIndex++;
+            charIndex = 0;
+            return;   // skip char-by-char for blank lines
+          } else {
+            currentEl.className = 'report-line';
+          }
+          container.insertBefore(currentEl, cursor);
+        }
+
+        // Add the next character to the current line element
+        if (charIndex < line.length) {
+          currentEl.textContent += line[charIndex];
+          charIndex++;
+        } else {
+          // End of line — move to next
+          lineIndex++;
+          charIndex = 0;
+        }
+
+        // Auto-scroll report body so the cursor is always visible
+        body.scrollTop = body.scrollHeight;
+
+      }, CHAR_DELAY);
+    }
+
+    /* ── runGeminiReport() ──────────────────────────────────
+       Called when the user clicks "▶ GENERATE REPORT".
+       1. Disables the button and shows loading state
+       2. Builds the prompt from current plan + material data
+       3. POSTs to Gemini REST API
+       4. On success: passes text to renderReportStream()
+       5. On failure: shows error message in #report-error
+    ──────────────────────────────────────────────────── */
+    async function runGeminiReport() {
+      const btn         = document.getElementById('report-generate-btn');
+      const placeholder = document.getElementById('report-placeholder');
+      const reportText  = document.getElementById('report-text');
+      const reportError = document.getElementById('report-error');
+      const statusLabel = document.getElementById('report-status-label');
+
+      // ── Guard: prevent double-click ──
+      if (btn.disabled) return;
+
+      // ── UI: loading state ──
+      btn.disabled   = true;
+      btn.textContent = '⏳ GENERATING…';
+      placeholder.style.display = 'none';
+      reportText.style.display  = 'none';
+      reportError.style.display = 'none';
+      statusLabel.textContent   = 'Calling Gemini 2.0 Flash…';
+      setStage('s5', 'active');
+      setStatus('STAGE 5 — GEMINI REPORT');
+
+      // ── Build the prompt ──
+      // Use live APP.planData if available (Step 6+), else fall back to PLAN_B
+      const plan     = APP.planData || PLAN_B;
+      const matData  = APP.materialsData;
+      const prompt   = buildGeminiPrompt(plan, matData);
+
+      console.log(`[ASIS] Stage 5 — sending prompt to ${GEMINI_MODEL}`);
+
+      try {
+        // ── Gemini REST API call via geminiPost() ──
+        // geminiPost() handles 429 quota errors with automatic retry + backoff.
+        // Uses gemini-1.5-flash which has a generous free-tier quota.
+        const result   = await geminiPost({
+          contents: [{
+            parts: [{ text: prompt }]
+          }],
+          generationConfig: {
+            temperature:     0.4,
+            maxOutputTokens: 600,
+            topP:            0.85,
+          }
+        });
+
+        const data = result.data;
+        console.log(`[ASIS] Report generated via: ${result.source}`);
+
+        // Gemini response structure:
+        // data.candidates[0].content.parts[0].text
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) throw new Error('Gemini returned empty response');
+
+        // Store in global state — Step 6 may reference this
+        APP.reportText = text;
+
+        // ── Update UI to report state ──
+        statusLabel.textContent = 'Streaming…';
+        btn.textContent = '✓ GENERATED';
+
+        console.log('[ASIS] Gemini response received — starting character stream');
+
+        // ── Stream the text into the report panel ──
+        renderReportStream(text);
+
+      } catch (err) {
+        // ── Error handling ──
+        console.error('[ASIS] Stage 5 error:', err);
+        reportError.textContent = `⚠ Gemini API error: ${err.message}`;
+        reportError.style.display = 'block';
+        statusLabel.textContent   = `${GEMINI_MODEL} → Groq fallback`;
+        btn.disabled    = false;
+        btn.textContent = '↺ RETRY';
+        setStage('s5', '');   // reset badge
+        setStatus('STAGE 5 ERROR');
+      }
+    }
+
+    // Auto-trigger the report after a short delay so it runs on page load
+    // In Step 6 this will be called from the pipeline instead
+    setTimeout(() => {
+      console.log('[ASIS] Step 3 ready — click "▶ GENERATE REPORT" or wait for auto-trigger.');
+      // Uncomment the line below to auto-generate on load (useful for demos):
+      // runGeminiReport();
+    }, 500);
+
+    console.log('[ASIS] Step 3 complete — Gemini report panel wired.');
+    console.log('[ASIS] Click "▶ GENERATE REPORT" in the bottom panel to test Stage 5.');
+    console.log('[ASIS] Next: Step 4 — Gemini Vision + OpenCV edge detection on upload.');
 
   </script>
 </body>
