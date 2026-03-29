@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ASIS — Autonomous Structural Intelligence System</title>
+
+  <!-- ─────────────────────────────────────────────
+       EXTERNAL LIBRARIES (loaded from CDN)
+       Three.js  → 3D rendering (Stage 3)
+       OpenCV.js → image edge detection (Stage 1 visual)
+  ───────────────────────────────────────────── -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- Three.js OrbitControls lets the user rotate/pan/zoom the 3D model -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <!-- OpenCV.js gives us computer-vision edge detection in the browser -->
+  <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()" onerror="console.warn('OpenCV failed to load')"></script>
+
+  <style>
+    /* ════════════════════════════════════════════
+       DESIGN TOKENS — change these to retheme
+    ════════════════════════════════════════════ */
+    :root {
+      --bg-base:       #0a0c10;   /* near-black page background          */
+      --bg-panel:      #111520;   /* individual panel background          */
+      --bg-panel-alt:  #0d1018;   /* slightly darker panel variant        */
+      --border:        #1e2535;   /* panel borders / dividers             */
+      --accent:        #00e5ff;   /* primary cyan accent (load-bearing)   */
+      --accent2:       #ff6b35;   /* orange accent (partition / alerts)   */
+      --accent3:       #7c3aed;   /* purple for columns/slabs             */
+      --text-primary:  #e8ecf4;   /* main readable text                   */
+      --text-muted:    #5a6480;   /* labels, hints, disabled text         */
+      --text-heading:  #ffffff;   /* panel headings                       */
+      --font-display:  'Courier New', monospace;  /* technical mono display */
+      --font-body:     'Segoe UI', system-ui, sans-serif;
+      --radius:        6px;
+      --panel-gap:     10px;
+    }
+
+    /* ─── RESET ─── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+
+    body {
+      background: var(--bg-base);
+      color: var(--text-primary);
+      font-family: var(--font-body);
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* ════════════════════════════════════════════
+       TOP BAR — header + upload button
+    ════════════════════════════════════════════ */
+    #header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      height: 52px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      gap: 12px;
+    }
+
+    #header .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+    #header .brand h1 {
+      font-family: var(--font-display);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 3px;
+    }
+    #header .brand span {
+      font-size: 11px;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+
+    /* Pipeline stage badges shown in the header */
+    #header .stages {
+      display: flex;
+      gap: 6px;
+    }
+    .stage-badge {
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-family: var(--font-display);
+      letter-spacing: 1px;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      background: transparent;
+      transition: all 0.3s;
+    }
+    /* When a stage is active/complete, it lights up */
+    .stage-badge.active  { color: var(--accent);  border-color: var(--accent);  background: rgba(0,229,255,.08); }
+    .stage-badge.done    { color: #4ade80;          border-color: #4ade80;         background: rgba(74,222,128,.08); }
+
+    /* Upload button + hidden file input */
+    #upload-area {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    #upload-btn {
+      padding: 7px 16px;
+      background: var(--accent);
+      color: #000;
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font-display);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    #upload-btn:hover { opacity: 0.85; }
+    #file-input { display: none; }  /* real input hidden; button triggers it */
+    #upload-label {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    /* ════════════════════════════════════════════
+       MAIN CONTENT AREA — three-column layout
+       Left: OpenCV canvas  |  Centre: Three.js  |  Right: materials
+    ════════════════════════════════════════════ */
+    #main {
+      display: flex;
+      flex: 1;
+      gap: var(--panel-gap);
+      padding: var(--panel-gap);
+      overflow: hidden;
+      min-height: 0;  /* prevents flex children from overflowing */
+    }
+
+    /* ─── Shared panel style ─── */
+    .panel {
+      background: var(--bg-panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-panel-alt);
+      flex-shrink: 0;
+    }
+    .panel-header .title {
+      font-family: var(--font-display);
+      font-size: 10px;
+      letter-spacing: 2px;
+      color: var(--accent);
+      text-transform: uppercase;
+    }
+    .panel-header .subtitle {
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+
+    .panel-body {
+      flex: 1;
+      overflow: hidden;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ─── LEFT PANEL — OpenCV edge detection ─── */
+    #panel-opencv {
+      width: 240px;      /* fixed width; the 3D viewer gets the remaining space */
+      flex-shrink: 0;
+    }
+    /* The canvas OpenCV will draw into */
+    #opencv-canvas {
+      max-width: 100%;
+      max-height: 100%;
+      display: block;
+    }
+    /* Placeholder shown before an image is uploaded */
+    #opencv-placeholder {
+      text-align: center;
+      padding: 20px;
+    }
+    #opencv-placeholder .icon {
+      font-size: 40px;
+      margin-bottom: 8px;
+      opacity: 0.3;
+    }
+    #opencv-placeholder p {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+
+    /* ─── CENTRE PANEL — Three.js 3D viewer (main focus) ─── */
+    #panel-3d {
+      flex: 1;   /* takes all remaining horizontal space */
+      min-width: 0;
+    }
+    /* Three.js will resize its renderer to match this div */
+    #threejs-container {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+    /* The canvas Three.js creates is injected into #threejs-container */
+
+    /* Colour legend overlay in the 3D panel */
+    #legend {
+      position: absolute;
+      bottom: 10px;
+      left: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      pointer-events: none;  /* doesn't block mouse interaction with 3D scene */
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10px;
+      color: var(--text-muted);
+    }
+    .legend-dot {
+      width: 10px; height: 10px;
+      border-radius: 2px;
+      flex-shrink: 0;
+    }
+
+    /* Status overlay shown in the 3D panel while processing */
+    #status-overlay {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: rgba(0,0,0,0.7);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 6px 10px;
+      font-family: var(--font-display);
+      font-size: 10px;
+      color: var(--accent);
+      letter-spacing: 1px;
+    }
+
+    /* ─── RIGHT PANEL — Material recommendations ─── */
+    #panel-materials {
+      width: 260px;
+      flex-shrink: 0;
+    }
+    /* Placeholder before analysis runs */
+    #materials-placeholder {
+      text-align: center;
+      padding: 20px;
+    }
+    #materials-placeholder .icon {
+      font-size: 36px;
+      margin-bottom: 8px;
+      opacity: 0.3;
+    }
+    #materials-placeholder p {
+      font-size: 11px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+    /* The actual results table (hidden until Stage 4 runs) */
+    #materials-table {
+      display: none;
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+    #materials-table th {
+      text-align: left;
+      padding: 6px 8px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      font-weight: 400;
+      font-family: var(--font-display);
+      font-size: 10px;
+      letter-spacing: 1px;
+    }
+    #materials-table td {
+      padding: 5px 8px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-primary);
+    }
+    #materials-table tr:last-child td { border-bottom: none; }
+    .score-bar {
+      height: 4px;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.4s ease;
+    }
+
+    /* ════════════════════════════════════════════
+       BOTTOM BAR — AI structural report (full width)
+    ════════════════════════════════════════════ */
+    #panel-report {
+      height: 160px;
+      flex-shrink: 0;
+      margin: 0 var(--panel-gap) var(--panel-gap);
+    }
+    #report-body {
+      padding: 10px 14px;
+      overflow-y: auto;
+      font-size: 12px;
+      line-height: 1.7;
+      color: var(--text-primary);
+      height: 100%;
+    }
+    /* Placeholder before Gemini report arrives */
+    #report-placeholder {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text-muted);
+      font-size: 11px;
+    }
+    #report-placeholder .dot {
+      width: 6px; height: 6px;
+      background: var(--text-muted);
+      border-radius: 50%;
+    }
+    /* When the report is streaming in, text appears here */
+    #report-text { display: none; }
+
+    /* ─── Loading spinner used in various panels ─── */
+    .spinner {
+      width: 28px; height: 28px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Drag-and-drop overlay for the entire page ─── */
+    #drop-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,229,255,0.06);
+      border: 3px dashed var(--accent);
+      border-radius: var(--radius);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-display);
+      font-size: 20px;
+      letter-spacing: 4px;
+      color: var(--accent);
+    }
+    #drop-overlay.active { display: flex; }
+
+    /* ─── Utility: scanline texture overlay (subtle CRT feel) ─── */
+    body::after {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0,0,0,0.04) 2px,
+        rgba(0,0,0,0.04) 4px
+      );
+      pointer-events: none;
+      z-index: 9999;
+    }
+
+    /* ─── Scrollbar styling ─── */
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+  </style>
+</head>
+<body>
+
+  <!-- ════════════════════════════════════════════
+       TOP BAR
+  ════════════════════════════════════════════ -->
+  <header id="header">
+    <div class="brand">
+      <h1>ASIS</h1>
+      <span>Autonomous Structural Intelligence System</span>
+    </div>
+
+    <!-- Pipeline stage progress badges — will be updated by JS as stages complete -->
+    <div class="stages" id="stage-badges">
+      <div class="stage-badge" id="badge-s1">S1·VISION</div>
+      <div class="stage-badge" id="badge-s2">S2·GEOMETRY</div>
+      <div class="stage-badge" id="badge-s3">S3·3D MODEL</div>
+      <div class="stage-badge" id="badge-s4">S4·MATERIALS</div>
+      <div class="stage-badge" id="badge-s5">S5·REPORT</div>
+    </div>
+
+    <!-- Image upload controls -->
+    <div id="upload-area">
+      <span id="upload-label">Upload floor plan to begin</span>
+      <!-- Clicking the button programmatically triggers the hidden file input -->
+      <button id="upload-btn" onclick="document.getElementById('file-input').click()">
+        ▲ UPLOAD PLAN
+      </button>
+      <input type="file" id="file-input" accept="image/*"/>
+    </div>
+  </header>
+
+  <!-- ════════════════════════════════════════════
+       MAIN THREE-COLUMN AREA
+  ════════════════════════════════════════════ -->
+  <div id="main">
+
+    <!-- ─── LEFT PANEL: OpenCV edge detection ─── -->
+    <div class="panel" id="panel-opencv">
+      <div class="panel-header">
+        <span class="title">STAGE 1 · EDGE DETECT</span>
+        <span class="subtitle">OpenCV.js</span>
+      </div>
+      <div class="panel-body" id="opencv-panel-body">
+        <!-- Placeholder shown before upload -->
+        <div id="opencv-placeholder">
+          <div class="icon">🗺</div>
+          <p>Upload a floor plan image.<br/>Edge detection preview will appear here.</p>
+        </div>
+        <!-- OpenCV will render into this canvas (hidden until image uploaded) -->
+        <canvas id="opencv-canvas" style="display:none;"></canvas>
+      </div>
+    </div>
+
+    <!-- ─── CENTRE PANEL: Three.js 3D viewer ─── -->
+    <div class="panel" id="panel-3d">
+      <div class="panel-header">
+        <span class="title">STAGE 3 · 3D STRUCTURAL MODEL</span>
+        <span class="subtitle">Three.js</span>
+      </div>
+      <div class="panel-body" id="panel-3d-body">
+        <!-- Three.js injects a <canvas> into this div -->
+        <div id="threejs-container"></div>
+
+        <!-- Colour-coding legend for the 3D scene -->
+        <div id="legend">
+          <div class="legend-item">
+            <div class="legend-dot" style="background:#00e5ff;"></div>
+            <span>Load-bearing wall</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background:#ff6b35;"></div>
+            <span>Partition wall</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background:#7c3aed;"></div>
+            <span>Column / slab</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background:#1a2a1a; border:1px solid #4ade80;"></div>
+            <span>Floor slab</span>
+          </div>
+        </div>
+
+        <!-- Live status text top-right of viewer -->
+        <div id="status-overlay">● STEP 0 — TEST CUBE</div>
+      </div>
+    </div>
+
+    <!-- ─── RIGHT PANEL: Material recommendations ─── -->
+    <div class="panel" id="panel-materials">
+      <div class="panel-header">
+        <span class="title">STAGE 4 · MATERIALS</span>
+        <span class="subtitle">Tradeoff Engine</span>
+      </div>
+      <div class="panel-body" style="align-items:flex-start; overflow-y:auto;">
+        <!-- Placeholder before Stage 4 runs -->
+        <div id="materials-placeholder" style="width:100%;">
+          <div class="icon">⚗️</div>
+          <p>Material recommendations will appear here after the floor plan is processed.</p>
+        </div>
+        <!-- Results table filled in by Stage 4 JS (hidden now) -->
+        <table id="materials-table">
+          <thead>
+            <tr>
+              <th>Element</th>
+              <th>Material</th>
+              <th>Score</th>
+            </tr>
+          </thead>
+          <tbody id="materials-tbody">
+            <!-- rows injected by renderMaterialsTable() in Step 2 -->
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div><!-- /#main -->
+
+  <!-- ════════════════════════════════════════════
+       BOTTOM BAR: AI structural report (full width)
+  ════════════════════════════════════════════ -->
+  <div class="panel" id="panel-report">
+    <div class="panel-header">
+      <span class="title">STAGE 5 · AI STRUCTURAL REPORT</span>
+      <span class="subtitle">Gemini 2.0 Flash</span>
+    </div>
+    <div id="report-body">
+      <div id="report-placeholder">
+        <div class="dot"></div>
+        <span>Awaiting floor plan analysis. Run the pipeline to generate the structural report.</span>
+      </div>
+      <!-- Actual report text streamed here by Stage 5 -->
+      <div id="report-text"></div>
+    </div>
+  </div>
+
+  <!-- Full-page drag-and-drop overlay (shown when user drags a file over window) -->
+  <div id="drop-overlay">DROP FLOOR PLAN TO ANALYSE</div>
+
+
+  <!-- ════════════════════════════════════════════
+       JAVASCRIPT
+  ════════════════════════════════════════════ -->
+  <script>
+    /* ─────────────────────────────────────────────────
+       GLOBAL STATE
+       As we build each step, we'll store pipeline data here.
+       Right now only the Three.js pieces are used.
+    ───────────────────────────────────────────────── */
+    const APP = {
+      uploadedImage: null,    // raw File object from the upload input
+      planData:      null,    // parsed JSON from Gemini vision (Stage 1)
+      materialsData: null,    // scored materials array (Stage 4)
+      reportText:    '',      // AI report string (Stage 5)
+      opencvReady:   false,   // set to true by onOpenCvReady()
+    };
+
+
+    /* ─────────────────────────────────────────────────
+       STAGE BADGE HELPERS
+       Call setStage('s3', 'active') or setStage('s3', 'done')
+       to light up the pipeline badges in the header.
+    ───────────────────────────────────────────────── */
+    function setStage(id, state) {
+      const el = document.getElementById('badge-' + id);
+      if (!el) return;
+      el.className = 'stage-badge ' + state;
+    }
+
+    /* Update the status overlay text inside the 3D panel */
+    function setStatus(msg) {
+      document.getElementById('status-overlay').textContent = '● ' + msg;
+    }
+
+
+    /* ─────────────────────────────────────────────────
+       OPENCVJS READY CALLBACK
+       OpenCV.js calls this function once it has fully loaded.
+       We just flip the flag; actual processing happens in Stage 1.
+    ───────────────────────────────────────────────── */
+    function onOpenCvReady() {
+      APP.opencvReady = true;
+      console.log('[ASIS] OpenCV.js ready');
+    }
+
+
+    /* ─────────────────────────────────────────────────
+       FILE UPLOAD — input + drag-and-drop
+       Both paths store the file in APP.uploadedImage and
+       will eventually kick off the full pipeline (Step 6).
+    ───────────────────────────────────────────────── */
+    const fileInput = document.getElementById('file-input');
+
+    fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) handleFile(file);
+    });
+
+    /* Drag-and-drop: show overlay while dragging over window */
+    window.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      document.getElementById('drop-overlay').classList.add('active');
+    });
+    window.addEventListener('dragleave', (e) => {
+      // Only hide overlay when leaving the window entirely
+      if (e.clientX === 0 && e.clientY === 0)
+        document.getElementById('drop-overlay').classList.remove('active');
+    });
+    window.addEventListener('drop', (e) => {
+      e.preventDefault();
+      document.getElementById('drop-overlay').classList.remove('active');
+      const file = e.dataTransfer.files[0];
+      if (file && file.type.startsWith('image/')) handleFile(file);
+    });
+
+    /* handleFile() will be expanded in Step 4 & 6 to run the full pipeline.
+       For now it just stores the file and logs it. */
+    function handleFile(file) {
+      APP.uploadedImage = file;
+      document.getElementById('upload-label').textContent = '✓ ' + file.name;
+      console.log('[ASIS] File loaded:', file.name);
+      // TODO Step 4: run OpenCV edge detection
+      // TODO Step 6: trigger full pipeline
+    }
+
+
+    /* ─────────────────────────────────────────────────
+       THREE.JS — STEP 0 SPINNING TEST CUBE
+       Purpose: confirm Three.js loads, canvas renders,
+       and OrbitControls work before we build the real model.
+
+       In Step 1 we will replace this with the actual extruded
+       wall geometry from the hardcoded Plan B coordinates.
+    ───────────────────────────────────────────────── */
+
+    // --- Scene setup ---
+    const scene    = new THREE.Scene();
+    scene.background = new THREE.Color(0x0d1018);   // match panel background
+
+    // Add a subtle grid on the ground plane for spatial context
+    const grid = new THREE.GridHelper(20, 20, 0x1e2535, 0x1a1f2e);
+    scene.add(grid);
+
+    // --- Camera ---
+    // PerspectiveCamera(fov, aspect, near, far)
+    // We'll update aspect ratio when the container resizes
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+    camera.position.set(4, 4, 8);   // slightly off-axis so the cube reads as 3D
+    camera.lookAt(0, 0, 0);
+
+    // --- Renderer ---
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.shadowMap.enabled = true;
+
+    // Inject the renderer's canvas into our container div
+    const container = document.getElementById('threejs-container');
+    container.appendChild(renderer.domElement);
+
+    // Set initial canvas size to match the container
+    function resizeRenderer() {
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      renderer.setSize(w, h);
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+    }
+    resizeRenderer();
+    window.addEventListener('resize', resizeRenderer);
+
+    // --- OrbitControls — lets user drag/scroll to rotate & zoom ---
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;      // smooth inertia feel
+    controls.dampingFactor = 0.07;
+    controls.minDistance = 2;
+    controls.maxDistance = 50;
+
+    // --- Lighting ---
+    // Ambient light fills all surfaces so nothing is pure black
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    // Directional light casts shadows and gives depth
+    const dirLight = new THREE.DirectionalLight(0x00e5ff, 1.2);
+    dirLight.position.set(5, 10, 7);
+    dirLight.castShadow = true;
+    scene.add(dirLight);
+
+    // A second, warmer fill light from below to reduce harsh shadows
+    const fillLight = new THREE.DirectionalLight(0xff6b35, 0.3);
+    fillLight.position.set(-5, -3, -5);
+    scene.add(fillLight);
+
+    // --- TEST CUBE (Step 0 only — replaced in Step 1) ---
+    // Wire-frame edges so the cube looks technical, not toy-like
+    const cubeGeo  = new THREE.BoxGeometry(2, 2, 2);
+    const cubeMat  = new THREE.MeshStandardMaterial({
+      color: 0x00e5ff,
+      wireframe: false,
+      transparent: true,
+      opacity: 0.25,
+    });
+    const cube = new THREE.Mesh(cubeGeo, cubeMat);
+    cube.castShadow = true;
+    scene.add(cube);
+
+    // Add visible edges to the cube so it reads clearly on the dark background
+    const edgesGeo = new THREE.EdgesGeometry(cubeGeo);
+    const edgesMat = new THREE.LineBasicMaterial({ color: 0x00e5ff, linewidth: 2 });
+    const edges    = new THREE.LineSegments(edgesGeo, edgesMat);
+    cube.add(edges);   // attach edges as a child so they rotate together
+
+    // Label: small text plane inside the cube (not added here—done via DOM overlay)
+
+    // --- Animation loop ---
+    // Three.js needs this loop running every frame to redraw the scene
+    function animate() {
+      requestAnimationFrame(animate);
+
+      // Slowly rotate the test cube — this gets removed in Step 1
+      cube.rotation.x += 0.004;
+      cube.rotation.y += 0.007;
+
+      // OrbitControls damping must be updated each frame
+      controls.update();
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // Mark Stage 3 as active in the header badges (test cube counts as "running")
+    setStage('s3', 'active');
+    console.log('[ASIS] Step 0 complete — Three.js spinning cube is live.');
+    console.log('[ASIS] Next: Step 1 — replace cube with extruded Plan B wall geometry.');
+
+  </script>
+</body>
+</html>
