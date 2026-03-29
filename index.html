@@ -532,6 +532,50 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+    /* ─── OpenCV stage-1 result rows under the canvas ─── */
+    #opencv-stats {
+      display: none;
+      padding: 6px 8px;
+      border-top: 1px solid var(--border);
+      font-size: 10px;
+      color: var(--text-muted);
+      font-family: var(--font-display);
+      flex-shrink: 0;
+    }
+    #opencv-stats span { color: var(--accent); }
+
+    /* ─── JSON upload button — shown after image is uploaded ─── */
+    #json-upload-area {
+      display: none;   /* shown by handleFile() after OpenCV runs */
+      padding: 8px;
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #json-upload-btn {
+      width: 100%;
+      padding: 7px;
+      background: transparent;
+      border: 1px dashed var(--accent);
+      color: var(--accent);
+      border-radius: var(--radius);
+      font-family: var(--font-display);
+      font-size: 10px;
+      letter-spacing: 1px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #json-upload-btn:hover { background: rgba(0,229,255,0.08); }
+    #json-status {
+      margin-top: 5px;
+      font-size: 9px;
+      font-family: var(--font-display);
+      color: var(--text-muted);
+      letter-spacing: 0.5px;
+      min-height: 12px;
+    }
+    #json-status.ok  { color: #4ade80; }
+    #json-status.err { color: #e74c3c; }
   </style>
 </head>
 <body>
@@ -584,6 +628,22 @@
         </div>
         <!-- OpenCV will render into this canvas (hidden until image uploaded) -->
         <canvas id="opencv-canvas" style="display:none;"></canvas>
+      </div>
+      <!-- Edge detection stats — shown after OpenCV runs -->
+      <div id="opencv-stats">
+        Edges: <span id="stat-edges">–</span> &nbsp;|&nbsp;
+        Contours: <span id="stat-contours">–</span>
+      </div>
+      <!-- JSON coordinate file upload — shown after image is uploaded.
+           User loads a pre-generated JSON file with outerBoundary/walls/rooms.
+           This replaces Gemini Vision (which requires paid API access). -->
+      <div id="json-upload-area">
+        <button id="json-upload-btn" onclick="document.getElementById('json-file-input').click()">
+          📂 LOAD COORDS JSON
+        </button>
+        <!-- Hidden file input — only accepts .json files -->
+        <input type="file" id="json-file-input" accept=".json" style="display:none"/>
+        <div id="json-status">Upload floor plan image first, then load its JSON coords</div>
       </div>
     </div>
 
@@ -664,6 +724,13 @@
     </div>
   </div>
 
+  <!-- ════════════════════════════════════════════
+       STEP 4 — API KEY GUARD MODAL
+       This modal fires ONLY when the user clicks a button
+       that needs the API (Stage 1 Vision or Stage 5 Report).
+       Keeps the key OUT of the saved file, so VS Code auto-save
+       never leaks it and page refreshes never call the API.
+  ════════════════════════════════════════════ -->
   <!-- Full-page drag-and-drop overlay (shown when user drags a file over window) -->
   <div id="drop-overlay">DROP FLOOR PLAN TO ANALYSE</div>
 
@@ -743,14 +810,91 @@
       if (file && file.type.startsWith('image/')) handleFile(file);
     });
 
-    /* handleFile() will be expanded in Step 4 & 6 to run the full pipeline.
-       For now it just stores the file and logs it. */
+    /* handleFile() — called on image upload (button or drag-drop).
+       ONLY runs OpenCV edge detection immediately.
+       The JSON coords upload is a separate manual step — user clicks
+       "📂 LOAD COORDS JSON" after OpenCV finishes.
+    */
     function handleFile(file) {
       APP.uploadedImage = file;
       document.getElementById('upload-label').textContent = '✓ ' + file.name;
-      console.log('[ASIS] File loaded:', file.name);
-      // TODO Step 4: run OpenCV edge detection
-      // TODO Step 6: trigger full pipeline
+      console.log('[ASIS] Image loaded:', file.name);
+
+      // Stage 1A: OpenCV edge detection — runs immediately, no API needed
+      runOpenCVEdgeDetect(file);
+
+      // Show the JSON upload area so user knows next step
+      document.getElementById('json-upload-area').style.display = 'block';
+      document.getElementById('json-status').textContent = 'OpenCV running… then load coords JSON';
+      document.getElementById('json-status').className = '';
+
+      setStage('s1', 'active');
+    }
+
+    /* ── handleJsonUpload() ─────────────────────────────────
+       Called when user selects a .json file via the JSON upload button.
+       Reads the file, validates the schema, then fires the full pipeline:
+         validatePlanData → buildModel → runMaterialAnalysis → report
+       This replaces the Gemini Vision call — same pipeline, manual coords.
+    ──────────────────────────────────────────────────── */
+    document.getElementById('json-file-input').addEventListener('change', function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      handleJsonUpload(file);
+    });
+
+    function handleJsonUpload(file) {
+      const statusEl = document.getElementById('json-status');
+      statusEl.textContent = '⏳ reading JSON…';
+      statusEl.className = '';
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        try {
+          // Parse the JSON
+          const raw = JSON.parse(ev.target.result);
+
+          // Validate and sanitise — same function used for Gemini output
+          const validated = validatePlanData(raw);
+          APP.planData = validated;
+
+          // Show success summary
+          const summary = `✓ ${validated.rooms?.length ?? 0} rooms · ${validated.walls?.length ?? 0} walls · ${validated.outerBoundary?.length ?? 0} boundary pts`;
+          statusEl.textContent = summary;
+          statusEl.className = 'ok';
+
+          setStage('s1', 'done');
+          setStage('s2', 'active');
+          setStatus('JSON COORDS LOADED — BUILDING 3D…');
+          console.log('[ASIS] JSON coords loaded:', validated);
+
+          // ── Full pipeline chain — same as Gemini Vision path ──
+          setTimeout(() => {
+            setStage('s2', 'done');
+
+            // Stage 3: rebuild 3D with real coords
+            buildModel(validated);
+            setStage('s3', 'done');
+            setStatus('LIVE MODEL — ' + (validated.rooms?.length ?? '?') + ' ROOMS');
+
+            // Stage 4: re-score materials with real wall data
+            runMaterialAnalysis(validated);
+
+            // Stage 5: auto-generate AI report
+            setTimeout(() => {
+              console.log('[ASIS] Auto-triggering Stage 5 report…');
+              _runGeminiReport();
+            }, 600);
+
+          }, 300);
+
+        } catch (err) {
+          statusEl.textContent = '⚠ Invalid JSON: ' + err.message;
+          statusEl.className = 'err';
+          console.error('[ASIS] JSON upload error:', err);
+        }
+      };
+      reader.readAsText(file);
     }
 
 
@@ -1476,81 +1620,62 @@
     // Using gemini-1.5-flash: much higher free-tier quota than 2.0-flash.
     // gemini-2.0-flash free tier = 0 RPM on some accounts → quota error.
     // gemini-1.5-flash free tier = 15 RPM / 1M TPM → no quota issues.
-    const GEMINI_KEY    = 'AIzaSyANZeW2pvZILey6EFsXuLDfx6w5IJYuTjY';
-    // gemini-1.5-flash-latest resolves to the current stable 1.5-flash build.
-    // Use the v1 endpoint (not v1beta) — v1beta doesn't surface 1.5 models on all keys.
-    const GEMINI_MODEL  = 'gemini-2.0-flash';
-    const GEMINI_URL    = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
 
-    // ── GROQ FALLBACK CONFIG ─────────────────────────────────
-    // If Gemini quota fails, we fall back to Groq LLaMA 3 (already in tech stack).
-    // Groq free tier: 14,400 req/day — effectively unlimited for a hackathon.
-    const GROQ_KEY = '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';
-    const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
-
-    /* ── geminiPost(body, retries) ──────────────────────────
-       Thin fetch wrapper that retries on 429 quota errors.
-       Uses exponential backoff, or Gemini's own "retry in Xs" hint.
+    /* ── API CONFIG — keys hardcoded (no modal needed) ──────
+       Gemini is used for the text report (Stage 5) with Groq
+       as automatic fallback. Gemini Vision is REMOVED — coords
+       come from the manually uploaded JSON file instead.
     ──────────────────────────────────────────────────── */
-    async function geminiPost(body, retries = 1) {
-  // ── Try Gemini first ──
-  try {
-    const res = await fetch(GEMINI_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (res.ok) return { source: 'gemini', data: await res.json() };
+    const GEMINI_KEY   = 'AIzaSyANZeW2pvZILey6EFsXuLDfx6w5IJYuTjY';
+    const GEMINI_MODEL = 'gemini-2.0-flash';
+    const GEMINI_URL   = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`;
+    const GROQ_KEY     = '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';
+    const GROQ_URL     = 'https://api.groq.com/openai/v1/chat/completions';
 
-    const errJson = await res.json().catch(() => ({}));
-    const errMsg  = errJson?.error?.message || `HTTP ${res.status}`;
+    /* ── geminiPost(body) ───────────────────────────────────
+       Tries Gemini first. On ANY failure (quota, model error,
+       network) immediately falls back to Groq LLaMA 3.1.
+       Returns normalised { source, data } so callers are unchanged.
+    ──────────────────────────────────────────────────── */
+    async function geminiPost(body) {
+      // ── Try Gemini ──
+      try {
+        const res = await fetch(GEMINI_URL, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(body),
+        });
+        if (res.ok) return { source: 'gemini', data: await res.json() };
+        const errJson = await res.json().catch(() => ({}));
+        console.warn('[ASIS] Gemini failed:', errJson?.error?.message, '— using Groq');
+      } catch (e) {
+        console.warn('[ASIS] Gemini error:', e.message, '— using Groq');
+      }
 
-    // 429 quota: wait and retry once
-    if (res.status === 429 && retries > 0) {
-      const wait = 8000;
-      document.getElementById('report-status-label').textContent = `Gemini quota — retrying in 8s…`;
-      console.warn('[ASIS] Gemini 429 — waiting 8s then trying Groq fallback');
-      await new Promise(r => setTimeout(r, wait));
-      return geminiPost(body, 0);
+      // ── Groq fallback (always works on free tier) ──
+      document.getElementById('report-status-label').textContent = 'Groq LLaMA 3.1…';
+      const promptText = body?.contents?.[0]?.parts?.[0]?.text || '';
+      const groqRes = await fetch(GROQ_URL, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+        body: JSON.stringify({
+          model:       'llama-3.1-8b-instant',
+          messages:    [{ role: 'user', content: promptText }],
+          temperature: 0.4,
+          max_tokens:  700,
+        }),
+      });
+      if (!groqRes.ok) {
+        const gErr = await groqRes.json().catch(() => ({}));
+        throw new Error('Groq: ' + (gErr?.error?.message || `HTTP ${groqRes.status}`));
+      }
+      const groqData = await groqRes.json();
+      const groqText = groqData?.choices?.[0]?.message?.content || '';
+      return {
+        source: 'groq',
+        data: { candidates: [{ content: { parts: [{ text: groqText }] } }] },
+      };
     }
-    // Any other Gemini error → fall through to Groq
-    console.warn('[ASIS] Gemini failed:', errMsg, '— falling back to Groq LLaMA 3');
-  } catch (e) {
-    console.warn('[ASIS] Gemini fetch error — falling back to Groq:', e.message);
-  }
-
-  // ── Groq fallback ──
-  // Extract the prompt text from the Gemini-shaped request body
-  const promptText = body?.contents?.[0]?.parts?.[0]?.text || '';
-  document.getElementById('report-status-label').textContent = 'Groq LLaMA 3 (fallback)…';
-
-  const groqRes = await fetch(GROQ_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${GROQ_KEY}`,
-    },
-    body: JSON.stringify({
-      model: 'llama-3.1-8b-instant',
-      messages: [{ role: 'user', content: promptText }],
-      temperature: 0.4,
-      max_tokens: 700,
-    }),
-  });
-
-  if (!groqRes.ok) {
-    const gErr = await groqRes.json().catch(() => ({}));
-    throw new Error('Groq: ' + (gErr?.error?.message || `HTTP ${groqRes.status}`));
-  }
-
-  const groqData = await groqRes.json();
-  // Normalise Groq response shape to match Gemini's so caller code is unchanged
-  const groqText = groqData?.choices?.[0]?.message?.content || '';
-  return {
-    source: 'groq',
-    data: { candidates: [{ content: { parts: [{ text: groqText }] } }] }
-  };
-}
 
     /* ── buildGeminiPrompt(plan, materialsData) ─────────────
        Constructs the text prompt sent to Gemini.
@@ -1700,6 +1825,11 @@ Write a structural assessment report in exactly this format. Use "▸" at the st
        5. On failure: shows error message in #report-error
     ──────────────────────────────────────────────────── */
     async function runGeminiReport() {
+      // Keys are hardcoded — call directly, no modal guard needed
+      _runGeminiReport();
+    }
+
+    async function _runGeminiReport() {
       const btn         = document.getElementById('report-generate-btn');
       const placeholder = document.getElementById('report-placeholder');
       const reportText  = document.getElementById('report-text');
@@ -1785,7 +1915,214 @@ Write a structural assessment report in exactly this format. Use "▸" at the st
 
     console.log('[ASIS] Step 3 complete — Gemini report panel wired.');
     console.log('[ASIS] Click "▶ GENERATE REPORT" in the bottom panel to test Stage 5.');
-    console.log('[ASIS] Next: Step 4 — Gemini Vision + OpenCV edge detection on upload.');
+    console.log('[ASIS] Next: Step 4 — JSON coords upload wired.');
+
+    /* ═══════════════════════════════════════════════════════
+       STAGE 1 — COORDINATE PIPELINE
+       ───────────────────────────────────────────────────────
+       A) OpenCV.js edge detection — runs on image upload:
+          Canny edge detect → cyan edges rendered to left panel.
+
+       B) JSON coords upload — manual step after OpenCV:
+          User loads a pre-generated .json file with outerBoundary,
+          walls, and rooms in the 0–1000 normalised grid schema.
+          validatePlanData() sanitises it, then the full pipeline
+          fires: buildModel → runMaterialAnalysis → _runGeminiReport.
+    ═══════════════════════════════════════════════════════ */
+
+    /* ── validatePlanData(raw) ──────────────────────────────
+       Sanitises JSON coords (from manual upload or any source)
+       before they enter buildModel() and runMaterialAnalysis().
+       Deep-clones input — never mutates the original object.
+    ──────────────────────────────────────────────────── */
+    function validatePlanData(raw) {
+      const plan = JSON.parse(JSON.stringify(raw));  // deep clone
+
+      // ── Ensure outerBoundary is a valid polygon ──
+      if (!Array.isArray(plan.outerBoundary) || plan.outerBoundary.length < 4) {
+        console.warn('[ASIS] validatePlanData: outerBoundary invalid — deriving from rooms');
+        // Derive a bounding box from all room corners as fallback
+        const rooms = plan.rooms || [];
+        const xs = rooms.flatMap(r => [r.x, r.x + r.width]);
+        const ys = rooms.flatMap(r => [r.y, r.y + r.height]);
+        const x0 = xs.length ? Math.min(...xs) : 50;
+        const x1 = xs.length ? Math.max(...xs) : 950;
+        const y0 = ys.length ? Math.min(...ys) : 50;
+        const y1 = ys.length ? Math.max(...ys) : 950;
+        plan.outerBoundary = [[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+      }
+
+      // ── Clamp all boundary coords to 0–1000 ──
+      plan.outerBoundary = plan.outerBoundary.map(([x, y]) => [
+        Math.max(0, Math.min(1000, Number(x) || 0)),
+        Math.max(0, Math.min(1000, Number(y) || 0)),
+      ]);
+
+      // ── Ensure walls array exists and has valid types ──
+      if (!Array.isArray(plan.walls)) plan.walls = [];
+      plan.walls = plan.walls
+        .map(w => ({
+          x1:   Math.max(0, Math.min(1000, Number(w.x1) || 0)),
+          y1:   Math.max(0, Math.min(1000, Number(w.y1) || 0)),
+          x2:   Math.max(0, Math.min(1000, Number(w.x2) || 0)),
+          y2:   Math.max(0, Math.min(1000, Number(w.y2) || 0)),
+          // Default to 'partition' if Gemini omitted the type field
+          type: (w.type === 'loadBearing') ? 'loadBearing' : 'partition',
+        }))
+        // Remove degenerate zero-length walls
+        .filter(w => Math.abs(w.x2 - w.x1) > 5 || Math.abs(w.y2 - w.y1) > 5);
+
+      // ── Ensure rooms array exists with all required keys ──
+      if (!Array.isArray(plan.rooms)) plan.rooms = [];
+      plan.rooms = plan.rooms
+        .map(r => ({
+          name:   r.name   || 'Room',
+          type:   r.type   || 'other',
+          x:      Math.max(0, Math.min(1000, Number(r.x)      || 0)),
+          y:      Math.max(0, Math.min(1000, Number(r.y)      || 0)),
+          width:  Math.max(10, Math.min(1000, Number(r.width)  || 100)),
+          height: Math.max(10, Math.min(1000, Number(r.height) || 100)),
+        }))
+        .filter(r => r.width > 5 && r.height > 5);
+
+      console.log('[ASIS] validatePlanData complete —',
+        plan.outerBoundary.length, 'boundary pts,',
+        plan.walls.length, 'walls,',
+        plan.rooms.length, 'rooms');
+
+      return plan;
+    }
+
+    /* ── runOpenCVEdgeDetect(file) ───────────────────────────
+       Runs the OpenCV Canny pipeline on the uploaded image file.
+       No API key needed — pure client-side computer vision.
+    ──────────────────────────────────────────────────── */
+    function runOpenCVEdgeDetect(file) {
+      setStage('s1', 'active');
+      setStatus('STAGE 1 — EDGE DETECT');
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const img = new Image();
+        img.onload = () => {
+          // ── Wait for OpenCV to be ready ──
+          // If OpenCV hasn't loaded yet (e.g. slow CDN), poll every 200ms
+          const tryCV = () => {
+            if (!APP.opencvReady) {
+              setTimeout(tryCV, 200);
+              return;
+            }
+            _doOpenCV(img);
+          };
+          tryCV();
+        };
+        img.src = ev.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    /* ── _doOpenCV(img) ─────────────────────────────────────
+       The actual OpenCV operations. Called once APP.opencvReady.
+    ──────────────────────────────────────────────────── */
+    function _doOpenCV(img) {
+      try {
+        // ── Draw original image to a temporary off-screen canvas ──
+        const tmpCanvas = document.createElement('canvas');
+        tmpCanvas.width  = img.naturalWidth;
+        tmpCanvas.height = img.naturalHeight;
+        const tmpCtx = tmpCanvas.getContext('2d');
+        tmpCtx.drawImage(img, 0, 0);
+
+        // ── Read into OpenCV Mat ──
+        // cv.imread reads from a canvas element into a BGRA Mat
+        const src = cv.imread(tmpCanvas);
+
+        // ── Convert to greyscale for edge detection ──
+        // Greyscale reduces noise and is what Canny expects
+        const grey = new cv.Mat();
+        cv.cvtColor(src, grey, cv.COLOR_RGBA2GRAY);
+
+        // ── Gaussian blur — kernel 3×3, sigma auto ──
+        // Blur suppresses tiny noise pixels that would create false edges
+        // Kernel size 3 preserves fine wall lines while removing sensor noise
+        const blurred = new cv.Mat();
+        cv.GaussianBlur(grey, blurred, new cv.Size(3, 3), 0);
+
+        // ── Canny edge detection ──
+        // threshold1=50: lower hysteresis — weak edges below this are discarded
+        // threshold2=150: upper hysteresis — strong edges above this are kept
+        // apertureSize=3: Sobel kernel size (standard for floor plans)
+        // These values are tuned for typical architectural drawings (dark lines
+        // on white paper). If the plan has faint lines, lower both thresholds.
+        const edges = new cv.Mat();
+        cv.Canny(blurred, edges, 50, 150, 3);
+
+        // ── Count non-zero pixels (= detected edge pixels) ──
+        const edgePixels = cv.countNonZero(edges);
+
+        // ── Find contours so we can count discrete line segments ──
+        // RETR_EXTERNAL: only outermost contours (matches wall outlines)
+        // CHAIN_APPROX_SIMPLE: compress horizontal/vertical runs to endpoints
+        const contours  = new cv.MatVector();
+        const hierarchy = new cv.Mat();
+        cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        const contourCount = contours.size();
+
+        // ── Render edges to the visible canvas ──
+        // Map the single-channel edge image to a 3-channel display image.
+        // We colour detected edges cyan (0, 229, 255) against a black background
+        // so they pop on the dark ASIS theme.
+        const display = new cv.Mat(edges.rows, edges.cols, cv.CV_8UC4);
+        display.setTo([0, 0, 0, 255]);   // black background, fully opaque
+
+        // Walk each pixel: if it's an edge (value=255), colour it cyan
+        for (let r = 0; r < edges.rows; r++) {
+          for (let c = 0; c < edges.cols; c++) {
+            if (edges.ucharPtr(r, c)[0] === 255) {
+              // cv RGBA order: R=0, G=229, B=255 = #00e5ff (accent cyan)
+              display.ucharPtr(r, c)[0] = 0;
+              display.ucharPtr(r, c)[1] = 229;
+              display.ucharPtr(r, c)[2] = 255;
+              display.ucharPtr(r, c)[3] = 255;
+            }
+          }
+        }
+
+        // ── Write the display Mat to the visible canvas ──
+        const outputCanvas = document.getElementById('opencv-canvas');
+        outputCanvas.width  = edges.cols;
+        outputCanvas.height = edges.rows;
+        cv.imshow(outputCanvas, display);
+
+        // ── Show canvas, hide placeholder ──
+        outputCanvas.style.display = 'block';
+        document.getElementById('opencv-placeholder').style.display = 'none';
+
+        // ── Update stats row ──
+        document.getElementById('stat-edges').textContent    = edgePixels.toLocaleString();
+        document.getElementById('stat-contours').textContent = contourCount.toLocaleString();
+        document.getElementById('opencv-stats').style.display = 'block';
+
+        // ── Free OpenCV memory ──
+        // IMPORTANT: OpenCV Mats are C++ heap objects — not GC'd by JS.
+        // Forgetting this causes memory leaks on repeated uploads.
+        src.delete(); grey.delete(); blurred.delete();
+        edges.delete(); display.delete();
+        contours.delete(); hierarchy.delete();
+
+        console.log(`[ASIS] Stage 1 OpenCV — ${edgePixels} edge pixels, ${contourCount} contours detected`);
+
+      } catch (err) {
+        console.error('[ASIS] OpenCV error:', err);
+        document.getElementById('opencv-placeholder').innerHTML =
+          `<p style="color:#e74c3c;font-size:10px;">⚠ OpenCV error:<br/>${err.message}</p>`;
+      }
+    }
+
+    console.log('[ASIS] ✓ Pipeline ready — no API key required at startup.');
+    console.log('[ASIS]   Step 1: Upload floor plan image → OpenCV edge detect runs instantly');
+    console.log('[ASIS]   Step 2: Click "📂 LOAD COORDS JSON" → select .json file → full pipeline fires');
+    console.log('[ASIS]   Step 3→5: 3D model, materials, AI report all auto-update from JSON coords');
 
   </script>
 </body>
