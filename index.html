@@ -677,10 +677,13 @@
         {x1:350, y1:50,  x2:350, y2:350, type:'loadBearing'},
         {x1:600, y1:50,  x2:600, y2:350, type:'loadBearing'},
         // Partition (room dividers — non-structural)
+        // REMOVED: {x1:650, y1:600, x2:650, y2:800} — this ran exactly along the
+        // outer boundary edge [650,800]→[650,950], so the perimeter loop was already
+        // drawing it as a load-bearing wall. Having it twice created the stray/floating
+        // wall visible in the centre-left of the model (the one circled in the photo).
         {x1:350, y1:350, x2:350, y2:600, type:'partition'},
         {x1:600, y1:350, x2:600, y2:600, type:'partition'},
         {x1:500, y1:600, x2:500, y2:800, type:'partition'},
-        {x1:650, y1:600, x2:650, y2:800, type:'partition'},
       ],
       rooms: [
         {name:'Great Room', x:50,  y:50,  width:300, height:300, type:'living'},
@@ -709,12 +712,14 @@
 
     /* ── WALL DIMENSIONS ────────────────────────────────
        WALL_H      : 3.0 world units  (~3 m storey height)
-       WALL_THICK  : 20 grid units converted to world units (~0.36)
-       OUTER_THICK : 30 grid units for perimeter walls  (~0.54)
+       WALL_THICK  : increased from 20→28 grid units so partition
+                     walls have enough visual depth at oblique angles
+                     and don't appear to float or disappear
+       OUTER_THICK : 35 grid units for perimeter walls (was 30)
     ──────────────────────────────────────────────────── */
     const WALL_H      = 3.0;
-    const WALL_THICK  = (20 / 1000) * WORLD_SCALE;   // interior ≈ 0.36
-    const OUTER_THICK = (30 / 1000) * WORLD_SCALE;   // perimeter ≈ 0.54
+    const WALL_THICK  = (28 / 1000) * WORLD_SCALE;   // interior ≈ 0.50 (was 0.36)
+    const OUTER_THICK = (35 / 1000) * WORLD_SCALE;   // perimeter ≈ 0.63 (was 0.54)
 
     /* ─────────────────────────────────────────────────────
        addEdges(mesh)
@@ -764,8 +769,8 @@
        extended. Free ends (no nearby LB wall) are left as-is.
     ───────────────────────────────────────────────────── */
     function processWalls(plan) {
-      const SNAP_THRESHOLD = 50;   // grid units — snap if closer than this
-      const EXTEND_GRID    = 18;   // grid units — how far to bury into LB wall
+      const SNAP_THRESHOLD = 80;   // increased from 50 — catches endpoints further from LB walls
+      const EXTEND_GRID    = 22;   // increased from 18 — deeper overlap into intersecting wall
 
       // Collect all LB reference segments (interior LB + outer boundary edges)
       const lbSegs = [];
@@ -781,7 +786,6 @@
       return plan.walls.map(wall => {
         if (wall.type !== 'partition') return wall;  // LB walls stay unchanged
 
-        // Unit vector pointing from p1 → p2 (the wall's own direction)
         const rawDx = wall.x2 - wall.x1, rawDy = wall.y2 - wall.y1;
         const rawLen = Math.hypot(rawDx, rawDy);
         const ux = rawDx / rawLen, uy = rawDy / rawLen;
@@ -789,21 +793,37 @@
         const s1 = snapToSegment(wall.x1, wall.y1, lbSegs, SNAP_THRESHOLD);
         const s2 = snapToSegment(wall.x2, wall.y2, lbSegs, SNAP_THRESHOLD);
 
-        // For a snapped endpoint, move it EXTEND_GRID units further INTO
-        // the LB wall (i.e. opposite to the wall's own direction for p1,
-        // same direction for p2). This guarantees box overlap = no gap.
         const nx1 = s1.snapped ? s1.x - ux * EXTEND_GRID : wall.x1;
         const ny1 = s1.snapped ? s1.y - uy * EXTEND_GRID : wall.y1;
         const nx2 = s2.snapped ? s2.x + ux * EXTEND_GRID : wall.x2;
         const ny2 = s2.snapped ? s2.y + uy * EXTEND_GRID : wall.y2;
 
-        if (s1.snapped || s2.snapped) {
-          console.log('[ASIS] snap:', wall.type, 
-            `(${wall.x1},${wall.y1})→(${wall.x2},${wall.y2})`,
-            'extended to',
-            `(${nx1.toFixed(1)},${ny1.toFixed(1)})→(${nx2.toFixed(1)},${ny2.toFixed(1)})`);
+        // AXIS-LOCK FIX: for perfectly vertical walls (x1===x2 in original data),
+        // force both endpoints to share the same x-coordinate after snapping.
+        // Without this, floating-point drift makes the wall lean slightly,
+        // appearing detached from the intersecting load-bearing wall.
+        const isVertical   = Math.abs(rawDx) < 1;
+        const isHorizontal = Math.abs(rawDy) < 1;
+
+        let fx1 = nx1, fy1 = ny1, fx2 = nx2, fy2 = ny2;
+        if (isVertical) {
+          // Both ends locked to the same X — whichever end snapped takes priority
+          const lockedX = s1.snapped ? s1.x : s2.snapped ? s2.x : wall.x1;
+          fx1 = lockedX; fx2 = lockedX;
         }
-        return { ...wall, x1: nx1, y1: ny1, x2: nx2, y2: ny2 };
+        if (isHorizontal) {
+          // Both ends locked to the same Y
+          const lockedY = s1.snapped ? s1.y : s2.snapped ? s2.y : wall.y1;
+          fy1 = lockedY; fy2 = lockedY;
+        }
+
+        if (s1.snapped || s2.snapped) {
+          console.log('[ASIS] snap:', wall.type,
+            `(${wall.x1},${wall.y1})→(${wall.x2},${wall.y2})`,
+            'locked+extended to',
+            `(${fx1.toFixed(1)},${fy1.toFixed(1)})→(${fx2.toFixed(1)},${fy2.toFixed(1)})`);
+        }
+        return { ...wall, x1: fx1, y1: fy1, x2: fx2, y2: fy2 };
       });
     }
 
@@ -988,9 +1008,10 @@
     // Mark Stage 3 as done in the header
     setStage('s3', 'done');
     setStatus('STEP 1 FIXED — PLAN B MODEL');
-    console.log('[ASIS] Step 1 (fixed) — Plan B 3D model rendered.');
-    console.log('[ASIS] Fix 1: partition walls snapped + extended into LB walls (no T-junction gaps).');
-    console.log('[ASIS] Fix 2: floor slab uses ShapeGeometry + rotation +PI/2 (no corner gap).');
+    console.log('[ASIS] Step 1 (fixed v2) — Plan B 3D model rendered.');
+    console.log('[ASIS] Fix A: removed duplicate wall at x=650 y600→y800 (was mirroring the outer boundary edge causing stray wall).');
+    console.log('[ASIS] Fix B: partition walls thicker (28 grid units) — more visible at all camera angles.');
+    console.log('[ASIS] Fix C: axis-lock applied to vertical/horizontal partitions — no drift at T-junctions.');
     console.log('[ASIS] Red = load-bearing | Grey = partition | Dark navy = floor slab');
     console.log('[ASIS] Ready for Step 2 — material tradeoff formula + results table.');
 
