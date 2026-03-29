@@ -619,60 +619,64 @@
 
 
     /* ═══════════════════════════════════════════════════════
-       THREE.JS — STEP 1: 3D STRUCTURAL MODEL (Plan B coords)
+       THREE.JS — STEP 1 (FIXED): 3D STRUCTURAL MODEL
        ───────────────────────────────────────────────────────
-       What this block does:
-         1. Sets up Scene / Camera / Renderer / OrbitControls
-         2. Defines the hardcoded Plan B floor plan data
-         3. Converts the 1000×1000 normalised grid to Three.js
-            world units via toWorld()
-         4. Builds the floor slab from the outer boundary polygon
-         5. Extrudes every wall segment as a BoxGeometry mesh,
-            rotated to match the wall's angle
-         6. Applies semantic colours:
-              #e74c3c  red  → load-bearing (structural danger)
-              #95a5a6  grey → partition    (non-structural)
-              #2c3e50  dark → floor slab
-         7. Adds edge outlines to every mesh for clarity
-       In Step 5 this function will be called again with real
-       Gemini-parsed coords to replace Plan B.
+       Fixes applied vs original Step 1:
+
+       FIX 1 — Partition wall T-junction gaps
+         Root cause: BoxGeometry for a partition wall ends exactly
+         at the LB wall CENTERLINE. The LB wall box extends
+         WALL_THICK/2 beyond that centerline on each face, leaving
+         a visible sliver gap at every T-junction.
+         Fix: snapToSegment() projects each partition endpoint onto
+         the nearest LB/boundary segment. processWalls() then
+         extends each snapped endpoint by EXTEND_GRID units PAST
+         the centerline so the partition box slightly overlaps
+         (buries into) the intersecting LB wall. The overlap is
+         hidden inside the LB wall — zero visible gap.
+
+       FIX 2 — Floor slab polygon gap
+         Root cause: rotation.x = -PI/2 maps shape Y → world -Z
+         (negated). The L-polygon coordinates were being mirrored,
+         which misaligned the polygon vertices and created a gap at
+         the re-entrant corner.
+         Fix: rotation.x = +PI/2 correctly maps shape Y → world +Z.
+         Also switched ExtrudeGeometry → ShapeGeometry (flat plane)
+         which removes all extrusion-direction ambiguity. The floor
+         is a pure polygon surface, no extrusion needed.
     ═══════════════════════════════════════════════════════ */
 
     /* ── COORDINATE HELPERS ──────────────────────────────
-       The plan data uses a normalised 1000×1000 grid.
-       We map that to ±HALF_SCALE in Three.js world units
-       so the model is centred on the origin.
-       X stays X; plan Y (vertical on paper) becomes Three.js Z.
+       Plan data uses a normalised 1000×1000 grid.
+       toWorld() maps it to ±HALF in Three.js world units,
+       centred at the origin.
+       Grid X → World X  (same axis)
+       Grid Y → World Z  (plan "down" = world "into screen")
     ──────────────────────────────────────────────────── */
-    const WORLD_SCALE = 18;         // 1000 grid units → 18 world units total
+    const WORLD_SCALE = 18;
     const HALF        = WORLD_SCALE / 2;
 
     function toWorld(gx, gy) {
-      // gx, gy: 0–1000 normalised coordinates
-      // returns {x, z} in Three.js world space, centred at origin
       return {
-        x:  (gx / 1000) * WORLD_SCALE - HALF,
-        z:  (gy / 1000) * WORLD_SCALE - HALF
+        x: (gx / 1000) * WORLD_SCALE - HALF,
+        z: (gy / 1000) * WORLD_SCALE - HALF,
       };
     }
 
     /* ── PLAN B — HARDCODED FLOOR PLAN DATA ─────────────
-       Source: project brief.
-       This is the fallback used while the Gemini vision
-       parser (Stage 1) isn't wired up yet.
-       Replaced in Step 5 by APP.planData from Gemini.
+       Replaced in Step 5 by live Gemini output.
     ──────────────────────────────────────────────────── */
     const PLAN_B = {
       outerBoundary: [
         [50,50],[950,50],[950,800],[650,800],[650,950],[50,950]
       ],
       walls: [
-        // ── Load-bearing walls (structural spine) ──────
+        // Load-bearing (structural spine + horizontal dividers)
         {x1:50,  y1:350, x2:950, y2:350, type:'loadBearing'},
         {x1:50,  y1:600, x2:650, y2:600, type:'loadBearing'},
         {x1:350, y1:50,  x2:350, y2:350, type:'loadBearing'},
         {x1:600, y1:50,  x2:600, y2:350, type:'loadBearing'},
-        // ── Partition walls (room dividers) ───────────
+        // Partition (room dividers — non-structural)
         {x1:350, y1:350, x2:350, y2:600, type:'partition'},
         {x1:600, y1:350, x2:600, y2:600, type:'partition'},
         {x1:500, y1:600, x2:500, y2:800, type:'partition'},
@@ -691,171 +695,217 @@
     };
 
     /* ── MATERIAL PALETTE ────────────────────────────────
-       Red   = load-bearing: signals structural criticality
-       Grey  = partition:    visually recedes, non-critical
-       Dark  = floor slab:   base plane, neutral reference
-       White = edge lines:   crispness without colour noise
+       Semantic colours — each colour has a structural reason:
+         #e74c3c  red    load-bearing  structural risk / do not remove
+         #95a5a6  grey   partition     non-structural / safe to modify
+         #2c3e50  dark   floor slab    base reference plane
     ──────────────────────────────────────────────────── */
     const MAT = {
-      loadBearing: new THREE.MeshStandardMaterial({
-        color: 0xe74c3c,          // red — danger / structural
-        roughness: 0.7,
-        metalness: 0.1,
-      }),
-      partition: new THREE.MeshStandardMaterial({
-        color: 0x95a5a6,          // grey — non-structural
-        roughness: 0.8,
-        metalness: 0.0,
-      }),
-      floor: new THREE.MeshStandardMaterial({
-        color: 0x2c3e50,          // dark navy — floor slab
-        roughness: 0.9,
-        metalness: 0.05,
-        side: THREE.DoubleSide,
-      }),
-      edge: new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.18 }),
+      loadBearing: new THREE.MeshStandardMaterial({ color: 0xe74c3c, roughness: 0.65, metalness: 0.1 }),
+      partition:   new THREE.MeshStandardMaterial({ color: 0x95a5a6, roughness: 0.80, metalness: 0.0 }),
+      floor:       new THREE.MeshStandardMaterial({ color: 0x2c3e50, roughness: 0.90, metalness: 0.05, side: THREE.DoubleSide }),
+      edge:        new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.15 }),
     };
 
-    /* ── WALL DIMENSIONS ─────────────────────────────────
-       Wall thickness: 20 grid units → (20/1000)*18 ≈ 0.36 world units
-       Wall height   : 3 world units (represents ~3 m)
-       Floor slab    : 0.12 world units thick, sits at y = −0.06
+    /* ── WALL DIMENSIONS ────────────────────────────────
+       WALL_H      : 3.0 world units  (~3 m storey height)
+       WALL_THICK  : 20 grid units converted to world units (~0.36)
+       OUTER_THICK : 30 grid units for perimeter walls  (~0.54)
     ──────────────────────────────────────────────────── */
-    const WALL_H     = 3.0;
-    const WALL_THICK = (20 / 1000) * WORLD_SCALE;   // ≈ 0.36
-    const SLAB_H     = 0.12;
+    const WALL_H      = 3.0;
+    const WALL_THICK  = (20 / 1000) * WORLD_SCALE;   // interior ≈ 0.36
+    const OUTER_THICK = (30 / 1000) * WORLD_SCALE;   // perimeter ≈ 0.54
 
     /* ─────────────────────────────────────────────────────
-       helper: addEdges(mesh)
-       Adds a white edge-outline child to any mesh so the
-       geometry reads clearly against the dark background.
+       addEdges(mesh)
+       Attaches crisp white edge-outline lines to any mesh.
+       Lines are added as a child, so they inherit the mesh's
+       transform automatically.
     ───────────────────────────────────────────────────── */
     function addEdges(mesh) {
       const eg = new THREE.EdgesGeometry(mesh.geometry);
       const em = new THREE.LineSegments(eg, MAT.edge);
-      mesh.add(em);   // child of mesh → inherits position/rotation
+      mesh.add(em);
     }
 
     /* ─────────────────────────────────────────────────────
-       buildModel(planData)
-       Takes a plan object (PLAN_B shape) and populates the
-       Three.js scene with floor slab + extruded wall meshes.
-       Called once now with PLAN_B; called again in Step 5
-       with real Gemini data.
+       snapToSegment(px, py, segs, threshold)
+       Projects point (px, py) onto every segment in `segs`
+       and returns the closest projection that is within
+       `threshold` grid units.
+       Returns: { x, y, snapped: bool }
+    ───────────────────────────────────────────────────── */
+    function snapToSegment(px, py, segs, threshold) {
+      let best = { x: px, y: py, snapped: false, dist: Infinity };
+      segs.forEach(([ax, ay, bx, by]) => {
+        const dx = bx - ax, dy = by - ay;
+        const lenSq = dx * dx + dy * dy;
+        if (lenSq < 1) return;
+        // t is the parameter along the segment (clamped 0–1)
+        const t  = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+        const cx = ax + t * dx, cy = ay + t * dy;
+        const d  = Math.hypot(px - cx, py - cy);
+        if (d < threshold && d < best.dist) best = { x: cx, y: cy, snapped: true, dist: d };
+      });
+      return best;
+    }
+
+    /* ─────────────────────────────────────────────────────
+       processWalls(plan)
+       Returns a NEW walls array where each partition wall's
+       endpoints have been:
+         1. SNAPPED  — projected onto the nearest LB/boundary
+                       segment centerline
+         2. EXTENDED — pushed EXTEND_GRID units past that
+                       centerline so the box slightly overlaps
+                       the intersecting wall (T-junction gap fix)
+
+       Only endpoints that actually snap (within threshold) are
+       extended. Free ends (no nearby LB wall) are left as-is.
+    ───────────────────────────────────────────────────── */
+    function processWalls(plan) {
+      const SNAP_THRESHOLD = 50;   // grid units — snap if closer than this
+      const EXTEND_GRID    = 18;   // grid units — how far to bury into LB wall
+
+      // Collect all LB reference segments (interior LB + outer boundary edges)
+      const lbSegs = [];
+      plan.walls
+        .filter(w => w.type === 'loadBearing')
+        .forEach(w => lbSegs.push([w.x1, w.y1, w.x2, w.y2]));
+      const ob = plan.outerBoundary;
+      for (let i = 0; i < ob.length; i++) {
+        const [ax, ay] = ob[i], [bx, by] = ob[(i + 1) % ob.length];
+        lbSegs.push([ax, ay, bx, by]);
+      }
+
+      return plan.walls.map(wall => {
+        if (wall.type !== 'partition') return wall;  // LB walls stay unchanged
+
+        // Unit vector pointing from p1 → p2 (the wall's own direction)
+        const rawDx = wall.x2 - wall.x1, rawDy = wall.y2 - wall.y1;
+        const rawLen = Math.hypot(rawDx, rawDy);
+        const ux = rawDx / rawLen, uy = rawDy / rawLen;
+
+        const s1 = snapToSegment(wall.x1, wall.y1, lbSegs, SNAP_THRESHOLD);
+        const s2 = snapToSegment(wall.x2, wall.y2, lbSegs, SNAP_THRESHOLD);
+
+        // For a snapped endpoint, move it EXTEND_GRID units further INTO
+        // the LB wall (i.e. opposite to the wall's own direction for p1,
+        // same direction for p2). This guarantees box overlap = no gap.
+        const nx1 = s1.snapped ? s1.x - ux * EXTEND_GRID : wall.x1;
+        const ny1 = s1.snapped ? s1.y - uy * EXTEND_GRID : wall.y1;
+        const nx2 = s2.snapped ? s2.x + ux * EXTEND_GRID : wall.x2;
+        const ny2 = s2.snapped ? s2.y + uy * EXTEND_GRID : wall.y2;
+
+        if (s1.snapped || s2.snapped) {
+          console.log('[ASIS] snap:', wall.type, 
+            `(${wall.x1},${wall.y1})→(${wall.x2},${wall.y2})`,
+            'extended to',
+            `(${nx1.toFixed(1)},${ny1.toFixed(1)})→(${nx2.toFixed(1)},${ny2.toFixed(1)})`);
+        }
+        return { ...wall, x1: nx1, y1: ny1, x2: nx2, y2: ny2 };
+      });
+    }
+
+    /* ─────────────────────────────────────────────────────
+       buildWallBox(x1, y1, x2, y2, height, thickness, mat)
+       Creates a single wall segment as a BoxGeometry mesh.
+       The box is length × height × thickness, centred at the
+       midpoint of the segment, rotated to align with the
+       wall direction.
+    ───────────────────────────────────────────────────── */
+    function buildWallBox(x1, y1, x2, y2, height, thickness, mat) {
+      const p1 = toWorld(x1, y1);
+      const p2 = toWorld(x2, y2);
+      const dx = p2.x - p1.x, dz = p2.z - p1.z;
+      const length = Math.sqrt(dx * dx + dz * dz);
+      if (length < 0.001) return null;   // degenerate segment, skip
+
+      const geo  = new THREE.BoxGeometry(length, height, thickness);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set((p1.x + p2.x) / 2, height / 2, (p1.z + p2.z) / 2);
+      mesh.rotation.y    = -Math.atan2(dz, dx);
+      mesh.castShadow    = true;
+      mesh.receiveShadow = true;
+      mesh.userData.isModel = true;
+      addEdges(mesh);
+      return mesh;
+    }
+
+    /* ─────────────────────────────────────────────────────
+       buildModel(plan)
+       Clears any previous model, then builds:
+         1. Floor slab  — flat ShapeGeometry from outerBoundary
+         2. Perimeter walls — LB (red), from outerBoundary edges
+         3. Interior walls  — LB (red) or partition (grey),
+            with partition endpoints snapped + extended first
+       Called with PLAN_B now; re-called in Step 5 with live data.
     ───────────────────────────────────────────────────── */
     function buildModel(plan) {
-      // Remove any existing model geometry from a previous build
-      // (needed when Step 5 re-calls this with new data)
+      // Clear previous build (needed when Step 5 swaps in Gemini data)
       scene.children
         .filter(o => o.userData.isModel)
         .forEach(o => scene.remove(o));
 
-      /* ── 1. FLOOR SLAB from outer boundary polygon ──
-         Convert the boundary point array to a THREE.Shape,
-         extrude it a little, then lay it flat (rotate −90°
-         around X so it lies on the XZ plane at y ≈ 0).
+      /* ── FIX 2: FLOOR SLAB ──────────────────────────
+         Build a THREE.Shape from the outerBoundary points in
+         their exact order (preserves the L-shape corners).
+         Feed each point as (worldX, worldZ) into the shape.
+         Then use ShapeGeometry (flat polygon — no extrusion).
+
+         Rotation: +Math.PI/2 around X maps
+           shape X → world X  ✓
+           shape Y → world +Z ✓
+         (The old -Math.PI/2 mapped shape Y → world -Z, mirroring
+         the polygon and creating the corner gap.)
       ── */
       const shape = new THREE.Shape();
       plan.outerBoundary.forEach(([gx, gy], i) => {
-        // Note: we use world X and world Z but feed them as
-        // Shape X,Y (Shape lives in 2D; we rotate later)
         const w = toWorld(gx, gy);
-        if (i === 0) shape.moveTo(w.x, w.z);
-        else         shape.lineTo(w.x, w.z);
+        // shape X = world X, shape Y = world Z (corrected winding)
+        i === 0 ? shape.moveTo(w.x, w.z) : shape.lineTo(w.x, w.z);
       });
-      shape.closePath();
+      shape.closePath();   // joins last point back to first — no gap possible
 
-      const slabGeo = new THREE.ExtrudeGeometry(shape, {
-        depth: SLAB_H,
-        bevelEnabled: false,
-      });
-      const slab = new THREE.Mesh(slabGeo, MAT.floor);
-      // ExtrudeGeometry extrudes along Z in 2D shape space;
-      // rotate so the slab lies flat on the XZ plane
-      slab.rotation.x = -Math.PI / 2;
-      slab.position.y = -SLAB_H;      // sit just below y = 0
+      const slabGeo = new THREE.ShapeGeometry(shape);
+      const slab    = new THREE.Mesh(slabGeo, MAT.floor);
+      slab.rotation.x    = Math.PI / 2;   // ← was -PI/2: mirrored Z (bug fixed)
+      slab.position.y    = -0.01;          // just below y=0, avoids z-fight with walls
       slab.receiveShadow = true;
       slab.userData.isModel = true;
-      addEdges(slab);
       scene.add(slab);
 
-      /* ── 2. WALL SEGMENTS ───────────────────────────
-         Each wall is defined by two endpoints (x1,y1)→(x2,y2).
-         We create a box of (length × WALL_H × WALL_THICK),
-         position it at the midpoint, and rotate it around Y
-         to align with the wall direction.
-      ── */
-      plan.walls.forEach(wall => {
-        const p1 = toWorld(wall.x1, wall.y1);
-        const p2 = toWorld(wall.x2, wall.y2);
-
-        // Length of this wall segment in world units
-        const dx     = p2.x - p1.x;
-        const dz     = p2.z - p1.z;
-        const length = Math.sqrt(dx * dx + dz * dz);
-
-        // Angle: atan2 gives us the rotation around Y axis
-        const angle  = Math.atan2(dz, dx);
-
-        // Midpoint (where we'll place the box centre)
-        const midX = (p1.x + p2.x) / 2;
-        const midZ = (p1.z + p2.z) / 2;
-
-        // BoxGeometry(width=length, height=WALL_H, depth=WALL_THICK)
-        const geo  = new THREE.BoxGeometry(length, WALL_H, WALL_THICK);
-        const mat  = wall.type === 'loadBearing' ? MAT.loadBearing : MAT.partition;
-        const mesh = new THREE.Mesh(geo, mat);
-
-        // Position: centre horizontally at midpoint, base sits at y = 0
-        mesh.position.set(midX, WALL_H / 2, midZ);
-        // Rotate around Y to match wall direction
-        mesh.rotation.y = -angle;
-
-        mesh.castShadow    = true;
-        mesh.receiveShadow = true;
-        mesh.userData.isModel     = true;
-        mesh.userData.wallType    = wall.type;
-
-        addEdges(mesh);
-        scene.add(mesh);
-      });
-
-      /* ── 3. OUTER PERIMETER WALLS ───────────────────
-         Convert the outer boundary polygon into wall segments
-         (each consecutive pair of boundary points = one wall).
-         These are always load-bearing (exterior walls).
+      /* ── PERIMETER WALLS ────────────────────────────
+         Walk the outerBoundary polygon edge by edge.
+         Every perimeter segment is load-bearing (red).
+         Slightly thicker than interior walls (OUTER_THICK).
       ── */
       const ob = plan.outerBoundary;
       for (let i = 0; i < ob.length; i++) {
         const [ax, ay] = ob[i];
-        const [bx, by] = ob[(i + 1) % ob.length];  // wrap around to close polygon
-
-        const p1 = toWorld(ax, ay);
-        const p2 = toWorld(bx, by);
-
-        const dx     = p2.x - p1.x;
-        const dz     = p2.z - p1.z;
-        const length = Math.sqrt(dx * dx + dz * dz);
-        const angle  = Math.atan2(dz, dx);
-
-        // Outer walls are slightly thicker (30 grid units)
-        const outerThick = (30 / 1000) * WORLD_SCALE;
-        const geo  = new THREE.BoxGeometry(length, WALL_H, outerThick);
-        const mesh = new THREE.Mesh(geo, MAT.loadBearing);  // always red
-
-        mesh.position.set((p1.x + p2.x) / 2, WALL_H / 2, (p1.z + p2.z) / 2);
-        mesh.rotation.y  = -angle;
-        mesh.castShadow  = true;
-        mesh.userData.isModel  = true;
-        mesh.userData.wallType = 'loadBearing';
-
-        addEdges(mesh);
-        scene.add(mesh);
+        const [bx, by] = ob[(i + 1) % ob.length];
+        const mesh = buildWallBox(ax, ay, bx, by, WALL_H, OUTER_THICK, MAT.loadBearing);
+        if (mesh) { mesh.userData.wallType = 'loadBearing'; scene.add(mesh); }
       }
 
-      console.log('[ASIS] buildModel() complete —',
-        plan.walls.length, 'interior walls +',
-        ob.length, 'perimeter walls + floor slab');
+      /* ── FIX 1: INTERIOR WALLS ──────────────────────
+         Run processWalls() BEFORE building geometry.
+         This snaps every partition endpoint onto the nearest
+         LB/boundary centerline, then extends it by EXTEND_GRID
+         units so the box slightly overlaps the intersecting wall.
+         Result: zero visible gaps at all T-junctions.
+      ── */
+      const processedWalls = processWalls(plan);
+
+      processedWalls.forEach(wall => {
+        const mat  = wall.type === 'loadBearing' ? MAT.loadBearing : MAT.partition;
+        const mesh = buildWallBox(wall.x1, wall.y1, wall.x2, wall.y2, WALL_H, WALL_THICK, mat);
+        if (mesh) { mesh.userData.wallType = wall.type; scene.add(mesh); }
+      });
+
+      const lb = processedWalls.filter(w => w.type === 'loadBearing').length;
+      const pt = processedWalls.filter(w => w.type === 'partition').length;
+      console.log(`[ASIS] buildModel() — ${ob.length} perimeter + ${lb} LB + ${pt} partition walls + floor slab`);
     }
 
 
@@ -937,10 +987,12 @@
 
     // Mark Stage 3 as done in the header
     setStage('s3', 'done');
-    setStatus('STEP 1 — PLAN B MODEL LOADED');
-    console.log('[ASIS] Step 1 complete — Plan B 3D model rendered.');
-    console.log('[ASIS] Red = load-bearing | Grey = partition | Dark = floor slab');
-    console.log('[ASIS] Next: Step 2 — material tradeoff formula + results table.');
+    setStatus('STEP 1 FIXED — PLAN B MODEL');
+    console.log('[ASIS] Step 1 (fixed) — Plan B 3D model rendered.');
+    console.log('[ASIS] Fix 1: partition walls snapped + extended into LB walls (no T-junction gaps).');
+    console.log('[ASIS] Fix 2: floor slab uses ShapeGeometry + rotation +PI/2 (no corner gap).');
+    console.log('[ASIS] Red = load-bearing | Grey = partition | Dark navy = floor slab');
+    console.log('[ASIS] Ready for Step 2 — material tradeoff formula + results table.');
 
   </script>
 </body>
