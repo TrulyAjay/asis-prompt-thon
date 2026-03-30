@@ -661,7 +661,7 @@
         <div id="legend">
           <div class="legend-item">
             <div class="legend-dot" style="background:#e74c3c;"></div>
-            <span>Load-bearing wall <em style="color:#5a6480;font-style:normal;">(structural risk)</em></span>
+            <span>Load-bearing wall <em style="color:#5a6480;font-style:normal;">(structural)</em></span>
           </div>
           <div class="legend-item">
             <div class="legend-dot" style="background:#95a5a6;"></div>
@@ -670,6 +670,10 @@
           <div class="legend-item">
             <div class="legend-dot" style="background:#2c3e50; border:1px solid #4a5568;"></div>
             <span>Floor slab</span>
+          </div>
+          <div class="legend-item">
+            <div class="legend-dot" style="background:rgba(26,37,48,0.5); border:1px solid #3a5068;"></div>
+            <span>Door opening</span>
           </div>
         </div>
 
@@ -954,6 +958,7 @@
       outerBoundary: [
         [50,50],[950,50],[950,800],[650,800],[650,950],[50,950]
       ],
+      _doorGaps: [],   // no door gaps in the hardcoded plan
       walls: [
         // Load-bearing (structural spine + horizontal dividers)
         // spanLength = metres (1000 grid = 10 m); needsColumn = span > 5 m
@@ -1133,68 +1138,117 @@
       return mesh;
     }
 
+    // Door gap material — slightly transparent dark panel to show opening
+    const MAT_DOOR = new THREE.MeshStandardMaterial({
+      color: 0x1a2530, roughness: 0.9, transparent: true, opacity: 0.18,
+      side: THREE.DoubleSide,
+    });
+
     /* ─────────────────────────────────────────────────────
        buildModel(plan)
        Clears any previous model, then builds:
          1. Floor slab  — flat ShapeGeometry from outerBoundary
-         2. Perimeter walls — LB (red), from outerBoundary edges
+         2. Perimeter walls — LB (red), from outerBoundary edges,
+            WITH door openings cut where _doorGaps are detected
          3. Interior walls  — LB (red) or partition (grey),
             with partition endpoints snapped + extended first
-       Called with PLAN_B now; re-called in Step 5 with live data.
     ───────────────────────────────────────────────────── */
     function buildModel(plan) {
-      // Clear previous build (needed when Step 5 swaps in Gemini data)
+      // Clear previous build
       scene.children
         .filter(o => o.userData.isModel)
         .forEach(o => scene.remove(o));
 
-      /* ── FIX 2: FLOOR SLAB ──────────────────────────
-         Build a THREE.Shape from the outerBoundary points in
-         their exact order (preserves the L-shape corners).
-         Feed each point as (worldX, worldZ) into the shape.
-         Then use ShapeGeometry (flat polygon — no extrusion).
-
-         Rotation: +Math.PI/2 around X maps
-           shape X → world X  ✓
-           shape Y → world +Z ✓
-         (The old -Math.PI/2 mapped shape Y → world -Z, mirroring
-         the polygon and creating the corner gap.)
-      ── */
+      /* ── FLOOR SLAB ───────────────────────────────── */
       const shape = new THREE.Shape();
       plan.outerBoundary.forEach(([gx, gy], i) => {
         const w = toWorld(gx, gy);
-        // shape X = world X, shape Y = world Z (corrected winding)
         i === 0 ? shape.moveTo(w.x, w.z) : shape.lineTo(w.x, w.z);
       });
-      shape.closePath();   // joins last point back to first — no gap possible
+      shape.closePath();
 
       const slabGeo = new THREE.ShapeGeometry(shape);
       const slab    = new THREE.Mesh(slabGeo, MAT.floor);
-      slab.rotation.x    = Math.PI / 2;   // ← was -PI/2: mirrored Z (bug fixed)
-      slab.position.y    = -0.01;          // just below y=0, avoids z-fight with walls
+      slab.rotation.x    = Math.PI / 2;
+      slab.position.y    = -0.01;
       slab.receiveShadow = true;
       slab.userData.isModel = true;
       scene.add(slab);
 
-      /* ── PERIMETER WALLS ────────────────────────────
-         Walk the outerBoundary polygon edge by edge.
-         Every perimeter segment is load-bearing (red).
-         Slightly thicker than interior walls (OUTER_THICK).
+      /* ── PERIMETER WALLS with door gap support ──────
+         For each boundary edge we check plan._doorGaps.
+         If no gaps on this edge → draw one full wall box.
+         If gaps exist → project all gaps onto the edge and
+         draw the solid wall SEGMENTS between them, leaving
+         openings where doors were detected.
       ── */
-      const ob = plan.outerBoundary;
+      const ob       = plan.outerBoundary;
+      const doorGaps = plan._doorGaps || [];
+
+      // Build a lookup: edgeIdx → sorted gaps on that edge
+      const gapsByEdge = new Map();
+      doorGaps.forEach(g => {
+        if (!gapsByEdge.has(g.edgeIdx)) gapsByEdge.set(g.edgeIdx, []);
+        gapsByEdge.get(g.edgeIdx).push(g);
+      });
+
       for (let i = 0; i < ob.length; i++) {
         const [ax, ay] = ob[i];
         const [bx, by] = ob[(i + 1) % ob.length];
-        const mesh = buildWallBox(ax, ay, bx, by, WALL_H, OUTER_THICK, MAT.loadBearing);
-        if (mesh) { mesh.userData.wallType = 'loadBearing'; scene.add(mesh); }
+
+        const gaps = gapsByEdge.get(i);
+        if (!gaps || gaps.length === 0) {
+          // No door on this edge — draw the full wall
+          const mesh = buildWallBox(ax, ay, bx, by, WALL_H, OUTER_THICK, MAT.loadBearing);
+          if (mesh) { mesh.userData.wallType = 'loadBearing'; scene.add(mesh); }
+        } else {
+          // Door(s) on this edge — draw wall segments between gaps
+          const edgeLen = Math.hypot(bx - ax, by - ay);
+          const ux = (bx - ax) / edgeLen, uy = (by - ay) / edgeLen;
+
+          // Project gaps as t values along this edge (0..edgeLen)
+          const gapIntervals = gaps.map(g => {
+            const t1 = (g.x1 - ax) * ux + (g.y1 - ay) * uy;
+            const t2 = (g.x2 - ax) * ux + (g.y2 - ay) * uy;
+            return [Math.max(0, Math.min(t1, t2)), Math.min(edgeLen, Math.max(t1, t2))];
+          }).sort((a, b) => a[0] - b[0]);
+
+          // Build the solid segments between gaps
+          let cursor = 0;
+          gapIntervals.forEach(([gStart, gEnd]) => {
+            if (gStart > cursor + 5) {
+              // Wall segment from cursor → gStart
+              const wx1 = ax + ux * cursor, wy1 = ay + uy * cursor;
+              const wx2 = ax + ux * gStart,  wy2 = ay + uy * gStart;
+              const mesh = buildWallBox(wx1, wy1, wx2, wy2, WALL_H, OUTER_THICK, MAT.loadBearing);
+              if (mesh) { mesh.userData.wallType = 'loadBearing'; scene.add(mesh); }
+            }
+            // Door opening: render a low transparent marker (optional visual cue)
+            const dw1 = toWorld(ax + ux * gStart, ay + uy * gStart);
+            const dw2 = toWorld(ax + ux * gEnd,   ay + uy * gEnd);
+            const doorW = Math.hypot(dw2.x - dw1.x, dw2.z - dw1.z);
+            const DOOR_H = WALL_H * 0.72; // door ~72% of wall height
+            const doorGeo  = new THREE.BoxGeometry(doorW, DOOR_H, OUTER_THICK * 0.4);
+            const doorMesh = new THREE.Mesh(doorGeo, MAT_DOOR);
+            doorMesh.position.set((dw1.x + dw2.x) / 2, DOOR_H / 2, (dw1.z + dw2.z) / 2);
+            doorMesh.rotation.y = -Math.atan2(dw2.z - dw1.z, dw2.x - dw1.x);
+            doorMesh.userData.isModel = true;
+            scene.add(doorMesh);
+
+            cursor = gEnd;
+          });
+          // Final segment after last gap → edge end
+          if (cursor < edgeLen - 5) {
+            const wx1 = ax + ux * cursor, wy1 = ay + uy * cursor;
+            const mesh = buildWallBox(wx1, wy1, bx, by, WALL_H, OUTER_THICK, MAT.loadBearing);
+            if (mesh) { mesh.userData.wallType = 'loadBearing'; scene.add(mesh); }
+          }
+        }
       }
 
-      /* ── FIX 1: INTERIOR WALLS ──────────────────────
-         Run processWalls() BEFORE building geometry.
-         This snaps every partition endpoint onto the nearest
-         LB/boundary centerline, then extends it by EXTEND_GRID
-         units so the box slightly overlaps the intersecting wall.
-         Result: zero visible gaps at all T-junctions.
+      /* ── INTERIOR WALLS ─────────────────────────────
+         processWalls() snaps partition endpoints onto LB
+         centerlines and extends them to eliminate T-gaps.
       ── */
       const processedWalls = processWalls(plan);
 
@@ -1206,7 +1260,7 @@
 
       const lb = processedWalls.filter(w => w.type === 'loadBearing').length;
       const pt = processedWalls.filter(w => w.type === 'partition').length;
-      console.log(`[ASIS] buildModel() — ${ob.length} perimeter + ${lb} LB + ${pt} partition walls + floor slab`);
+      console.log(`[ASIS] buildModel() — ${ob.length} perimeter edges | ${lb} interior LB | ${pt} partition | ${doorGaps.length} door gap(s)`);
     }
 
 
@@ -2016,26 +2070,7 @@ Write a plain-language structural assessment report that a non-engineer client c
       // ── 3. Normalise walls ──
       if (!Array.isArray(plan.walls)) plan.walls = [];
 
-      // Build a Set of outer-boundary edges so interior walls near them
-      // are NOT re-classified as loadBearing due to position alone.
-      // We use this below to help identify truly interior LB walls.
       const obNorm = plan.outerBoundary;  // already normalised above
-
-      // Helper: is this wall along (or very close to) the outer boundary?
-      function isOuterEdge(wx1, wy1, wx2, wy2) {
-        const EDGE_TOL = 30; // grid units tolerance for "on boundary"
-        for (let i = 0; i < obNorm.length; i++) {
-          const [ax, ay] = obNorm[i];
-          const [bx, by] = obNorm[(i + 1) % obNorm.length];
-          const sameLine =
-            (Math.abs(wx1 - ax) < EDGE_TOL && Math.abs(wy1 - ay) < EDGE_TOL &&
-             Math.abs(wx2 - bx) < EDGE_TOL && Math.abs(wy2 - by) < EDGE_TOL) ||
-            (Math.abs(wx1 - bx) < EDGE_TOL && Math.abs(wy1 - by) < EDGE_TOL &&
-             Math.abs(wx2 - ax) < EDGE_TOL && Math.abs(wy2 - ay) < EDGE_TOL);
-          if (sameLine) return true;
-        }
-        return false;
-      }
 
       // Helper: compute span length in metres from grid coords
       // 1000 grid units ≈ 10 m (typical house width)
@@ -2044,44 +2079,125 @@ Write a plain-language structural assessment report that a non-engineer client c
         return parseFloat(((gridLen / 1000) * 10).toFixed(2));
       }
 
-      plan.walls = plan.walls
-        .map(w => {
-          // Some models use {start:{x,y}, end:{x,y}} format
-          const x1 = Math.round(Math.max(0, Math.min(1000, Number(w.x1 ?? w.start?.x ?? 0) * scaleFactor)));
-          const y1 = Math.round(Math.max(0, Math.min(1000, Number(w.y1 ?? w.start?.y ?? 0) * scaleFactor)));
-          const x2 = Math.round(Math.max(0, Math.min(1000, Number(w.x2 ?? w.end?.x   ?? 0) * scaleFactor)));
-          const y2 = Math.round(Math.max(0, Math.min(1000, Number(w.y2 ?? w.end?.y   ?? 0) * scaleFactor)));
+      // Helper: does point (px,py) lie on the line segment (ax,ay)→(bx,by)?
+      // Uses the cross-product test (collinearity) + bounding-box containment.
+      function pointOnSegment(px, py, ax, ay, bx, by, tol) {
+        // Cross product magnitude — zero means collinear
+        const cross = Math.abs((bx - ax) * (py - ay) - (by - ay) * (px - ax));
+        const segLen = Math.hypot(bx - ax, by - ay);
+        if (segLen < 1) return false;
+        if (cross / segLen > tol) return false; // too far from the line
+        // Must be within the bounding box of the segment (with tolerance)
+        return px >= Math.min(ax, bx) - tol && px <= Math.max(ax, bx) + tol &&
+               py >= Math.min(ay, by) - tol && py <= Math.max(ay, by) + tol;
+      }
 
-          // ── Stage 2 Geometry Logic ──────────────────────────────
-          // Rule 1: Outer walls → always loadBearing
-          // Rule 2: Internal room dividers → partition
-          // Rule 3: Any wall whose raw type says loadBearing → keep as loadBearing
-          // Rule 4: Undefined/unknown type → default to partition (safe assumption)
-          let wallType = normaliseWallType(w.type);
-
-          // Override: if the wall lies on the outer boundary, force loadBearing
-          if (isOuterEdge(x1, y1, x2, y2)) {
-            wallType = 'loadBearing';
+      // Helper: is a wall segment fully contained in the outer boundary?
+      // Handles BOTH full-edge matches AND sub-segments (door gap segments).
+      // A wall is "on the boundary" if BOTH its endpoints lie on the same
+      // boundary edge (within tolerance). This catches Gemini's habit of
+      // splitting a boundary wall into two segments with a door gap between.
+      function isOnBoundaryEdge(wx1, wy1, wx2, wy2) {
+        const EDGE_TOL = 18; // grid units perpendicular tolerance
+        for (let i = 0; i < obNorm.length; i++) {
+          const [ax, ay] = obNorm[i];
+          const [bx, by] = obNorm[(i + 1) % obNorm.length];
+          if (pointOnSegment(wx1, wy1, ax, ay, bx, by, EDGE_TOL) &&
+              pointOnSegment(wx2, wy2, ax, ay, bx, by, EDGE_TOL)) {
+            return true;
           }
+        }
+        return false;
+      }
 
-          // ── Span length and column flag ──────────────────────────
-          // Use pre-computed spanLength from JSON if available (Step 4 output),
-          // otherwise compute it here from coordinates.
-          const spanM = (typeof w.spanLength === 'number' && w.spanLength > 0)
-            ? w.spanLength
-            : gridToMetres(x1, y1, x2, y2);
+      // ── First pass: normalise coordinates and classify types ──
+      const rawWalls = plan.walls.map(w => {
+        const x1 = Math.round(Math.max(0, Math.min(1000, Number(w.x1 ?? w.start?.x ?? 0) * scaleFactor)));
+        const y1 = Math.round(Math.max(0, Math.min(1000, Number(w.y1 ?? w.start?.y ?? 0) * scaleFactor)));
+        const x2 = Math.round(Math.max(0, Math.min(1000, Number(w.x2 ?? w.end?.x   ?? 0) * scaleFactor)));
+        const y2 = Math.round(Math.max(0, Math.min(1000, Number(w.y2 ?? w.end?.y   ?? 0) * scaleFactor)));
 
-          const needsColumn = wallType === 'loadBearing' && spanM > 5;
+        // Stage 2 Geometry Logic — classify wall type:
+        // Rule 1: Walls whose both endpoints lie on the same outer boundary edge
+        //         are perimeter walls. We flag them as 'perimeter' and SKIP them
+        //         from plan.walls so buildModel() doesn't draw them twice.
+        //         buildModel() already loops outerBoundary to draw perimeter walls.
+        // Rule 2: Interior walls typed 'loadBearing' stay loadBearing.
+        // Rule 3: Undefined/unknown type → partition (safe).
+        const onBoundary = isOnBoundaryEdge(x1, y1, x2, y2);
+        let wallType = onBoundary ? 'perimeter' : normaliseWallType(w.type);
 
-          return {
-            x1, y1, x2, y2,
-            type:        wallType,       // always 'loadBearing' or 'partition' — never undefined
-            spanLength:  spanM,          // metres, 2 decimal places
-            needsColumn,                 // true when LB span > 5m
-          };
-        })
-        // Remove degenerate zero-length walls (< 5 grid units)
-        .filter(w => Math.abs(w.x2 - w.x1) > 5 || Math.abs(w.y2 - w.y1) > 5);
+        // Door-gap detection: if a segment is on the boundary but shorter than
+        // the full edge, it is a wall-with-opening. We keep it for door rendering
+        // but still skip it from the wall-loop (perimeter loop already draws the edge).
+
+        const spanM = (typeof w.spanLength === 'number' && w.spanLength > 0)
+          ? w.spanLength
+          : gridToMetres(x1, y1, x2, y2);
+
+        const needsColumn = (wallType === 'loadBearing') && spanM > 5;
+
+        return { x1, y1, x2, y2, type: wallType, spanLength: spanM, needsColumn, onBoundary };
+      });
+
+      // ── Second pass: extract door gaps from boundary walls ──
+      // When Gemini splits a boundary edge into 2 segments with a gap,
+      // that gap is a door opening. Collect these gaps as door markers.
+      const boundaryWallsByEdge = new Map(); // key = edge index → array of sub-segments
+      rawWalls.forEach(w => {
+        if (!w.onBoundary) return;
+        for (let i = 0; i < obNorm.length; i++) {
+          const [ax, ay] = obNorm[i];
+          const [bx, by] = obNorm[(i + 1) % obNorm.length];
+          const EDGE_TOL = 18;
+          if (pointOnSegment(w.x1, w.y1, ax, ay, bx, by, EDGE_TOL) &&
+              pointOnSegment(w.x2, w.y2, ax, ay, bx, by, EDGE_TOL)) {
+            if (!boundaryWallsByEdge.has(i)) boundaryWallsByEdge.set(i, []);
+            boundaryWallsByEdge.get(i).push(w);
+            break;
+          }
+        }
+      });
+
+      // Store door gaps for buildModel() to render as openings
+      plan._doorGaps = [];
+      boundaryWallsByEdge.forEach((segs, edgeIdx) => {
+        const [ax, ay] = obNorm[edgeIdx];
+        const [bx, by] = obNorm[(edgeIdx + 1) % obNorm.length];
+        const edgeLen = Math.hypot(bx - ax, by - ay);
+        // Only compute gaps if there are multiple sub-segments (a real split)
+        if (segs.length < 2) return;
+        // Sort segments along the edge direction
+        const ux = (bx - ax) / edgeLen, uy = (by - ay) / edgeLen;
+        const projectedSegs = segs.map(s => {
+          const t1 = (s.x1 - ax) * ux + (s.y1 - ay) * uy;
+          const t2 = (s.x2 - ax) * ux + (s.y2 - ay) * uy;
+          return { t1: Math.min(t1, t2), t2: Math.max(t1, t2), seg: s };
+        }).sort((a, b) => a.t1 - b.t1);
+        // Gaps = spaces between consecutive segments on this edge
+        for (let k = 0; k < projectedSegs.length - 1; k++) {
+          const gapStart = projectedSegs[k].t2;
+          const gapEnd   = projectedSegs[k + 1].t1;
+          if (gapEnd - gapStart > 10) { // min 10 grid units to count as a door
+            plan._doorGaps.push({
+              x1: ax + ux * gapStart, y1: ay + uy * gapStart,
+              x2: ax + ux * gapEnd,   y2: ay + uy * gapEnd,
+              edgeIdx,
+            });
+          }
+        }
+      });
+
+      // ── Final walls array: keep only INTERIOR walls (no perimeter duplicates) ──
+      plan.walls = rawWalls
+        .filter(w => !w.onBoundary)                                      // drop perimeter dups
+        .filter(w => Math.abs(w.x2 - w.x1) > 5 || Math.abs(w.y2 - w.y1) > 5) // drop degenerate
+        .map(w => ({                                                      // clean output
+          x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2,
+          type:       w.type,       // 'loadBearing' or 'partition'
+          spanLength: w.spanLength,
+          needsColumn: w.needsColumn,
+        }));
 
       // ── 4. Normalise rooms ──
       if (!Array.isArray(plan.rooms)) plan.rooms = [];
@@ -2114,12 +2230,14 @@ Write a plain-language structural assessment report that a non-engineer client c
       delete plan.spans;
 
       const longSpanCount = plan.walls.filter(w => w.needsColumn).length;
+      const doorGapCount  = (plan._doorGaps || []).length;
       console.log('[ASIS] validatePlanData —',
         plan.outerBoundary.length, 'boundary pts |',
-        plan.walls.length, 'walls |',
+        plan.walls.length, 'interior walls |',
         plan.rooms.length, 'rooms |',
         `scale: ${scaleFactor.toFixed(3)} |`,
-        `${longSpanCount} long-span wall(s) flagged (>5m)`);
+        `${longSpanCount} long-span(s) |`,
+        `${doorGapCount} door gap(s) detected`);
 
       return plan;
     }
