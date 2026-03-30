@@ -865,12 +865,16 @@
 
           setStage('s1', 'done');
           setStage('s2', 'active');
-          setStatus('JSON COORDS LOADED — BUILDING 3D…');
-          console.log('[ASIS] JSON coords loaded:', validated);
+          setStatus('STAGE 2 — GEOMETRY LOGIC RUNNING…');
+          console.log('[ASIS] JSON coords loaded — Stage 2 geometry logic applied during validation');
+          console.log('[ASIS] Validated plan:', validated);
 
           // ── Full pipeline chain — same as Gemini Vision path ──
           setTimeout(() => {
+            // Stage 2 is complete — geometry logic (spanLength, needsColumn,
+            // outer/inner wall classification) was applied inside validatePlanData()
             setStage('s2', 'done');
+            setStatus('STAGE 2 DONE — BUILDING 3D…');
 
             // Stage 3: rebuild 3D with real coords
             buildModel(validated);
@@ -952,18 +956,15 @@
       ],
       walls: [
         // Load-bearing (structural spine + horizontal dividers)
-        {x1:50,  y1:350, x2:950, y2:350, type:'loadBearing'},
-        {x1:50,  y1:600, x2:650, y2:600, type:'loadBearing'},
-        {x1:350, y1:50,  x2:350, y2:350, type:'loadBearing'},
-        {x1:600, y1:50,  x2:600, y2:350, type:'loadBearing'},
+        // spanLength = metres (1000 grid = 10 m); needsColumn = span > 5 m
+        {x1:50,  y1:350, x2:950, y2:350, type:'loadBearing', spanLength:9.0,  needsColumn:true  },
+        {x1:50,  y1:600, x2:650, y2:600, type:'loadBearing', spanLength:6.0,  needsColumn:true  },
+        {x1:350, y1:50,  x2:350, y2:350, type:'loadBearing', spanLength:3.0,  needsColumn:false },
+        {x1:600, y1:50,  x2:600, y2:350, type:'loadBearing', spanLength:3.0,  needsColumn:false },
         // Partition (room dividers — non-structural)
-        // REMOVED: {x1:650, y1:600, x2:650, y2:800} — this ran exactly along the
-        // outer boundary edge [650,800]→[650,950], so the perimeter loop was already
-        // drawing it as a load-bearing wall. Having it twice created the stray/floating
-        // wall visible in the centre-left of the model (the one circled in the photo).
-        {x1:350, y1:350, x2:350, y2:600, type:'partition'},
-        {x1:600, y1:350, x2:600, y2:600, type:'partition'},
-        {x1:500, y1:600, x2:500, y2:800, type:'partition'},
+        {x1:350, y1:350, x2:350, y2:600, type:'partition',   spanLength:2.5,  needsColumn:false },
+        {x1:600, y1:350, x2:600, y2:600, type:'partition',   spanLength:2.5,  needsColumn:false },
+        {x1:500, y1:600, x2:500, y2:800, type:'partition',   spanLength:2.0,  needsColumn:false },
       ],
       rooms: [
         {name:'Great Room', x:50,  y:50,  width:300, height:300, type:'living'},
@@ -1441,6 +1442,14 @@
     function buildElementList(plan) {
       const elements = [];
 
+      // ── Verify Stage 2 geometry data on walls ──
+      const missingType   = plan.walls.filter(w => !w.type).length;
+      const missingSpan   = plan.walls.filter(w => typeof w.spanLength !== 'number').length;
+      if (missingType > 0)  console.warn(`[ASIS] Stage 2 WARN: ${missingType} wall(s) missing type — defaulted to partition`);
+      if (missingSpan > 0)  console.warn(`[ASIS] Stage 2 WARN: ${missingSpan} wall(s) missing spanLength — will compute from coords`);
+      if (!missingType && !missingSpan)
+        console.log('[ASIS] Stage 2 ✓ — all walls have type + spanLength + needsColumn');
+
       // ── Perimeter walls (outer boundary edges) ───────
       const ob = plan.outerBoundary;
       for (let i = 0; i < ob.length; i++) {
@@ -1460,9 +1469,16 @@
 
       // ── Interior walls (from plan.walls array) ───────
       plan.walls.forEach((wall, i) => {
-        const spanM       = computeSpanLength(wall);
-        const isLB        = wall.type === 'loadBearing';
-        const needsColumn = isLB && spanM > 5;
+        // Use pre-computed spanLength if Stage 2 geometry logic added it;
+        // fall back to computing from raw coordinates for PLAN_B / legacy data.
+        const spanM       = (typeof wall.spanLength === 'number' && wall.spanLength > 0)
+                            ? wall.spanLength
+                            : computeSpanLength(wall);
+        const isLB        = wall.type === 'loadBearing';   // always defined after validatePlanData
+        // Respect pre-computed needsColumn from Stage 2 if available
+        const needsColumn = (typeof wall.needsColumn === 'boolean')
+                            ? wall.needsColumn
+                            : (isLB && spanM > 5);
         // Long load-bearing spans → longSpan; short LB → loadBearing; partition → partition
         const elementType = !isLB ? 'partition'
                           : needsColumn ? 'longSpan'
@@ -1691,6 +1707,12 @@
       const rooms    = plan.rooms.length;
       const perim    = plan.outerBoundary.length;
 
+      // Describe the plan shape from vertex count
+      const shapeDesc = perim <= 4 ? 'rectangular'
+                      : perim <= 6 ? 'L-shaped'
+                      : perim <= 8 ? 'complex polygon'
+                      : 'irregular polygon';
+
       // Pull top material picks from Stage 4 results
       const topLB   = rankMaterials('loadBearing')[0];
       const topPT   = rankMaterials('partition')[0];
@@ -1709,7 +1731,7 @@
       return `You are a senior structural engineer producing a concise technical assessment of a residential floor plan that has been analysed by an AI pipeline.
 
 FLOOR PLAN DATA:
-- Plan shape: L-shaped (${perim}-vertex polygon)
+- Plan shape: ${shapeDesc} (${perim}-vertex polygon)
 - Rooms (${rooms}): ${roomList}
 - Load-bearing walls: ${lbWalls} interior + ${perim} perimeter
 - Partition walls: ${ptWalls}
@@ -1721,25 +1743,25 @@ MATERIAL ANALYSIS RESULTS (from tradeoff scoring engine):
 - Best material for floor slab: ${topSlab.name} (score: ${topSlab.score.toFixed(2)})
 - Best material for long spans: ${topLS.name} (score: ${topLS.score.toFixed(2)})
 
-Write a structural assessment report in exactly this format. Use "▸" at the start of each section heading. Keep each section to 1-2 sentences. Be specific, use the data above, and avoid vague language.
+Write a plain-language structural assessment report that a non-engineer client can understand. Use "▸" at the start of each section heading. Keep each section to 1–2 sentences. Be specific, reference the actual numbers and materials above, and avoid vague language.
 
 ▸ STRUCTURAL OVERVIEW
-[Describe the overall structural system, wall count, and L-shape implications]
+[Describe the overall structural system, total wall count, and what the ${shapeDesc} plan shape means for load distribution]
 
 ▸ LOAD-BEARING ANALYSIS
-[Comment on the load-bearing wall layout and why the recommended material was chosen]
+[Explain which walls carry the building's load and why ${topLB.name} was the top-ranked material — plain language, no jargon]
 
 ▸ PARTITION SYSTEM
-[Comment on partition walls, their material choice, and the cost rationale]
+[Explain what partition walls do (or don't do structurally), why ${topPT.name} is recommended, and the cost saving rationale]
 
 ▸ SLAB & LONG-SPAN ASSESSMENT
-[Address the floor slab recommendation and any flagged long-span elements]
+[Explain the floor slab recommendation (${topSlab.name}) and describe any flagged long-span issues in plain language]
 
 ▸ RISK FLAGS
-[List any structural concerns: long spans, unsupported loads, L-shape stress concentrations]
+[List any structural concerns found: ${flagged.length > 0 ? flaggedText + ' need column support' : 'note if the plan is concern-free, and mention any general L-shape stress concentration risk'}]
 
 ▸ RECOMMENDATION SUMMARY
-[One sentence conclusion: is this plan structurally sound, and what is the single most important action?]`;
+[One plain-English sentence: is this plan structurally sound, and what is the single most important action the builder should take?]`;
     }
 
     /* ── renderReportStream(fullText) ───────────────────────
@@ -1993,19 +2015,69 @@ Write a structural assessment report in exactly this format. Use "▸" at the st
 
       // ── 3. Normalise walls ──
       if (!Array.isArray(plan.walls)) plan.walls = [];
+
+      // Build a Set of outer-boundary edges so interior walls near them
+      // are NOT re-classified as loadBearing due to position alone.
+      // We use this below to help identify truly interior LB walls.
+      const obNorm = plan.outerBoundary;  // already normalised above
+
+      // Helper: is this wall along (or very close to) the outer boundary?
+      function isOuterEdge(wx1, wy1, wx2, wy2) {
+        const EDGE_TOL = 30; // grid units tolerance for "on boundary"
+        for (let i = 0; i < obNorm.length; i++) {
+          const [ax, ay] = obNorm[i];
+          const [bx, by] = obNorm[(i + 1) % obNorm.length];
+          const sameLine =
+            (Math.abs(wx1 - ax) < EDGE_TOL && Math.abs(wy1 - ay) < EDGE_TOL &&
+             Math.abs(wx2 - bx) < EDGE_TOL && Math.abs(wy2 - by) < EDGE_TOL) ||
+            (Math.abs(wx1 - bx) < EDGE_TOL && Math.abs(wy1 - by) < EDGE_TOL &&
+             Math.abs(wx2 - ax) < EDGE_TOL && Math.abs(wy2 - ay) < EDGE_TOL);
+          if (sameLine) return true;
+        }
+        return false;
+      }
+
+      // Helper: compute span length in metres from grid coords
+      // 1000 grid units ≈ 10 m (typical house width)
+      function gridToMetres(gx1, gy1, gx2, gy2) {
+        const gridLen = Math.sqrt((gx2 - gx1) ** 2 + (gy2 - gy1) ** 2);
+        return parseFloat(((gridLen / 1000) * 10).toFixed(2));
+      }
+
       plan.walls = plan.walls
         .map(w => {
           // Some models use {start:{x,y}, end:{x,y}} format
-          const x1 = Number(w.x1 ?? w.start?.x ?? 0) * scaleFactor;
-          const y1 = Number(w.y1 ?? w.start?.y ?? 0) * scaleFactor;
-          const x2 = Number(w.x2 ?? w.end?.x   ?? 0) * scaleFactor;
-          const y2 = Number(w.y2 ?? w.end?.y   ?? 0) * scaleFactor;
+          const x1 = Math.round(Math.max(0, Math.min(1000, Number(w.x1 ?? w.start?.x ?? 0) * scaleFactor)));
+          const y1 = Math.round(Math.max(0, Math.min(1000, Number(w.y1 ?? w.start?.y ?? 0) * scaleFactor)));
+          const x2 = Math.round(Math.max(0, Math.min(1000, Number(w.x2 ?? w.end?.x   ?? 0) * scaleFactor)));
+          const y2 = Math.round(Math.max(0, Math.min(1000, Number(w.y2 ?? w.end?.y   ?? 0) * scaleFactor)));
+
+          // ── Stage 2 Geometry Logic ──────────────────────────────
+          // Rule 1: Outer walls → always loadBearing
+          // Rule 2: Internal room dividers → partition
+          // Rule 3: Any wall whose raw type says loadBearing → keep as loadBearing
+          // Rule 4: Undefined/unknown type → default to partition (safe assumption)
+          let wallType = normaliseWallType(w.type);
+
+          // Override: if the wall lies on the outer boundary, force loadBearing
+          if (isOuterEdge(x1, y1, x2, y2)) {
+            wallType = 'loadBearing';
+          }
+
+          // ── Span length and column flag ──────────────────────────
+          // Use pre-computed spanLength from JSON if available (Step 4 output),
+          // otherwise compute it here from coordinates.
+          const spanM = (typeof w.spanLength === 'number' && w.spanLength > 0)
+            ? w.spanLength
+            : gridToMetres(x1, y1, x2, y2);
+
+          const needsColumn = wallType === 'loadBearing' && spanM > 5;
+
           return {
-            x1:   Math.round(Math.max(0, Math.min(1000, x1))),
-            y1:   Math.round(Math.max(0, Math.min(1000, y1))),
-            x2:   Math.round(Math.max(0, Math.min(1000, x2))),
-            y2:   Math.round(Math.max(0, Math.min(1000, y2))),
-            type: normaliseWallType(w.type),
+            x1, y1, x2, y2,
+            type:        wallType,       // always 'loadBearing' or 'partition' — never undefined
+            spanLength:  spanM,          // metres, 2 decimal places
+            needsColumn,                 // true when LB span > 5m
           };
         })
         // Remove degenerate zero-length walls (< 5 grid units)
@@ -2034,16 +2106,20 @@ Write a structural assessment report in exactly this format. Use "▸" at the st
       // ── 5. Strip unused keys (doors, spans, confidence, planName) ──
       // These are present in the PS prompt schema but not used by buildModel.
       // Leaving them in is harmless but stripping keeps APP.planData clean.
+      // Note: spanLength and needsColumn on each wall are KEPT — Stage 2 output.
       delete plan.doors;
-      delete plan.spans;
       delete plan.confidence;
       delete plan.planName;
+      // spans (top-level) is separate from per-wall spanLength — strip top-level only
+      delete plan.spans;
 
+      const longSpanCount = plan.walls.filter(w => w.needsColumn).length;
       console.log('[ASIS] validatePlanData —',
         plan.outerBoundary.length, 'boundary pts |',
         plan.walls.length, 'walls |',
         plan.rooms.length, 'rooms |',
-        `scale: ${scaleFactor.toFixed(3)}`);
+        `scale: ${scaleFactor.toFixed(3)} |`,
+        `${longSpanCount} long-span wall(s) flagged (>5m)`);
 
       return plan;
     }
