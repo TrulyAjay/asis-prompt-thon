@@ -1933,62 +1933,117 @@ Write a structural assessment report in exactly this format. Use "▸" at the st
     /* ── validatePlanData(raw) ──────────────────────────────
        Sanitises JSON coords (from manual upload or any source)
        before they enter buildModel() and runMaterialAnalysis().
-       Deep-clones input — never mutates the original object.
+
+       HANDLES these real-world Gemini variations:
+         • walls typed as "internal"/"exterior" → mapped to partition/loadBearing
+         • walls typed as "loadbearing" (lowercase) → normalised
+         • room bounds given as {x,y,width,height} OR as bounds:{x,y,width,height}
+         • outerBoundary given as [[x,y]] OR as [{x,y}] objects
+         • doors/spans keys present but unused — stripped cleanly
+         • any coordinate > 1000 — rescaled proportionally to 0-1000 grid
     ──────────────────────────────────────────────────── */
     function validatePlanData(raw) {
       const plan = JSON.parse(JSON.stringify(raw));  // deep clone
 
-      // ── Ensure outerBoundary is a valid polygon ──
+      // ── 1. Normalise outerBoundary ──
+      // Accept [[x,y]] arrays OR [{x,y}] objects
       if (!Array.isArray(plan.outerBoundary) || plan.outerBoundary.length < 4) {
-        console.warn('[ASIS] validatePlanData: outerBoundary invalid — deriving from rooms');
-        // Derive a bounding box from all room corners as fallback
+        console.warn('[ASIS] outerBoundary invalid — deriving from rooms');
         const rooms = plan.rooms || [];
-        const xs = rooms.flatMap(r => [r.x, r.x + r.width]);
-        const ys = rooms.flatMap(r => [r.y, r.y + r.height]);
-        const x0 = xs.length ? Math.min(...xs) : 50;
-        const x1 = xs.length ? Math.max(...xs) : 950;
-        const y0 = ys.length ? Math.min(...ys) : 50;
-        const y1 = ys.length ? Math.max(...ys) : 950;
+        const xs = rooms.flatMap(r => {
+          const rx = r.x ?? r.bounds?.x ?? 0;
+          const rw = r.width ?? r.bounds?.width ?? 100;
+          return [rx, rx + rw];
+        });
+        const ys = rooms.flatMap(r => {
+          const ry = r.y ?? r.bounds?.y ?? 0;
+          const rh = r.height ?? r.bounds?.height ?? 100;
+          return [ry, ry + rh];
+        });
+        const x0 = xs.length ? Math.min(...xs) : 50,  x1 = xs.length ? Math.max(...xs) : 950;
+        const y0 = ys.length ? Math.min(...ys) : 50,  y1 = ys.length ? Math.max(...ys) : 950;
         plan.outerBoundary = [[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
       }
 
-      // ── Clamp all boundary coords to 0–1000 ──
+      // Normalise boundary point format [{x,y}] → [[x,y]]
+      plan.outerBoundary = plan.outerBoundary.map(pt =>
+        Array.isArray(pt) ? pt : [pt.x ?? 0, pt.y ?? 0]
+      );
+
+      // Auto-rescale if coordinates exceed 1000 (some models use pixel coords)
+      const allCoords = plan.outerBoundary.flat();
+      const maxCoord  = Math.max(...allCoords);
+      const scaleFactor = maxCoord > 1000 ? 1000 / maxCoord : 1;
+
       plan.outerBoundary = plan.outerBoundary.map(([x, y]) => [
-        Math.max(0, Math.min(1000, Number(x) || 0)),
-        Math.max(0, Math.min(1000, Number(y) || 0)),
+        Math.round(Math.max(0, Math.min(1000, (Number(x) || 0) * scaleFactor))),
+        Math.round(Math.max(0, Math.min(1000, (Number(y) || 0) * scaleFactor))),
       ]);
 
-      // ── Ensure walls array exists and has valid types ──
+      // ── 2. Normalise wall type strings ──
+      // Maps all Gemini variants to exactly 'loadBearing' or 'partition'
+      function normaliseWallType(t) {
+        if (!t) return 'partition';
+        const s = String(t).toLowerCase().replace(/[-_\s]/g, '');
+        if (s === 'loadbearing' || s === 'load' || s === 'structural'
+            || s === 'exterior' || s === 'external' || s === 'outer'
+            || s === 'bearing') return 'loadBearing';
+        return 'partition';   // 'internal', 'partition', 'inner', anything else
+      }
+
+      // ── 3. Normalise walls ──
       if (!Array.isArray(plan.walls)) plan.walls = [];
       plan.walls = plan.walls
-        .map(w => ({
-          x1:   Math.max(0, Math.min(1000, Number(w.x1) || 0)),
-          y1:   Math.max(0, Math.min(1000, Number(w.y1) || 0)),
-          x2:   Math.max(0, Math.min(1000, Number(w.x2) || 0)),
-          y2:   Math.max(0, Math.min(1000, Number(w.y2) || 0)),
-          // Default to 'partition' if Gemini omitted the type field
-          type: (w.type === 'loadBearing') ? 'loadBearing' : 'partition',
-        }))
-        // Remove degenerate zero-length walls
+        .map(w => {
+          // Some models use {start:{x,y}, end:{x,y}} format
+          const x1 = Number(w.x1 ?? w.start?.x ?? 0) * scaleFactor;
+          const y1 = Number(w.y1 ?? w.start?.y ?? 0) * scaleFactor;
+          const x2 = Number(w.x2 ?? w.end?.x   ?? 0) * scaleFactor;
+          const y2 = Number(w.y2 ?? w.end?.y   ?? 0) * scaleFactor;
+          return {
+            x1:   Math.round(Math.max(0, Math.min(1000, x1))),
+            y1:   Math.round(Math.max(0, Math.min(1000, y1))),
+            x2:   Math.round(Math.max(0, Math.min(1000, x2))),
+            y2:   Math.round(Math.max(0, Math.min(1000, y2))),
+            type: normaliseWallType(w.type),
+          };
+        })
+        // Remove degenerate zero-length walls (< 5 grid units)
         .filter(w => Math.abs(w.x2 - w.x1) > 5 || Math.abs(w.y2 - w.y1) > 5);
 
-      // ── Ensure rooms array exists with all required keys ──
+      // ── 4. Normalise rooms ──
       if (!Array.isArray(plan.rooms)) plan.rooms = [];
       plan.rooms = plan.rooms
-        .map(r => ({
-          name:   r.name   || 'Room',
-          type:   r.type   || 'other',
-          x:      Math.max(0, Math.min(1000, Number(r.x)      || 0)),
-          y:      Math.max(0, Math.min(1000, Number(r.y)      || 0)),
-          width:  Math.max(10, Math.min(1000, Number(r.width)  || 100)),
-          height: Math.max(10, Math.min(1000, Number(r.height) || 100)),
-        }))
+        .map(r => {
+          // Accept flat {x,y,width,height} OR nested {bounds:{x,y,width,height}}
+          const rx = Number(r.x ?? r.bounds?.x ?? 0) * scaleFactor;
+          const ry = Number(r.y ?? r.bounds?.y ?? 0) * scaleFactor;
+          const rw = Number(r.width  ?? r.bounds?.width  ?? 100) * scaleFactor;
+          const rh = Number(r.height ?? r.bounds?.height ?? 100) * scaleFactor;
+          return {
+            name:   String(r.name   || 'Room'),
+            type:   String(r.type   || 'other'),
+            x:      Math.round(Math.max(0, Math.min(1000, rx))),
+            y:      Math.round(Math.max(0, Math.min(1000, ry))),
+            width:  Math.round(Math.max(10, Math.min(1000, rw))),
+            height: Math.round(Math.max(10, Math.min(1000, rh))),
+          };
+        })
         .filter(r => r.width > 5 && r.height > 5);
 
-      console.log('[ASIS] validatePlanData complete —',
-        plan.outerBoundary.length, 'boundary pts,',
-        plan.walls.length, 'walls,',
-        plan.rooms.length, 'rooms');
+      // ── 5. Strip unused keys (doors, spans, confidence, planName) ──
+      // These are present in the PS prompt schema but not used by buildModel.
+      // Leaving them in is harmless but stripping keeps APP.planData clean.
+      delete plan.doors;
+      delete plan.spans;
+      delete plan.confidence;
+      delete plan.planName;
+
+      console.log('[ASIS] validatePlanData —',
+        plan.outerBoundary.length, 'boundary pts |',
+        plan.walls.length, 'walls |',
+        plan.rooms.length, 'rooms |',
+        `scale: ${scaleFactor.toFixed(3)}`);
 
       return plan;
     }
